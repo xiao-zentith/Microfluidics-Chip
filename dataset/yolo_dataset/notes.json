@@ -1,0 +1,21 @@
+{
+  "categories": [
+    {
+      "id": 0,
+      "name": "chamber_dark"
+    },
+    {
+      "id": 1,
+      "name": "chamber_lit"
+    },
+    {
+      "id": 2,
+      "name": "pocket"
+    }
+  ],
+  "info": {
+    "year": 2025,
+    "version": "1.0",
+    "contributor": "Label Studio"
+  }
+}

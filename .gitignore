@@ -1,0 +1,24 @@
+# 忽略所有图片文件
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.gif
+*.svg
+*.webp
+*.heic
+*.ico
+*.raw
+
+# 忽略 Numpy 数据文件
+*.npz
+*.npy
+
+# 忽略 权重文件
+*.pt
