@@ -22,3 +22,8 @@
 
 # 忽略 权重文件
 *.pt
+
+.idea/
+.vscode/
+__pycache__/
+*.pyc
