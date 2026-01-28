@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microfluidics-chip"
+version = "0.1.0"
+description = "Microfluidic chip image processing pipeline with YOLO detection and UNet correction"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Microfluidics Team"}
+]
+keywords = ["microfluidics", "image-processing", "yolo", "unet", "computer-vision"]
+
+dependencies = [
+    "torch>=2.0.0",
+    "ultralytics>=8.0.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "PyYAML>=6.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+microfluidics-chip = "microfluidics_chip.pipelines.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["deprecated", ".git", "dist", "build", "__pycache__"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --strict-markers"
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | deprecated
+  | dist
+  | build
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+exclude = ["deprecated", ".git", "dist", "build"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+exclude = ["deprecated/"]

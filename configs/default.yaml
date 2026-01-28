@@ -1,0 +1,48 @@
+# 微流控芯片项目默认配置
+# Microfluidics Chip Default Configuration
+
+experiment_name: "microfluidics_default"
+
+# 路径配置
+paths:
+  data_dir: "data"
+  runs_dir: "runs"
+  weights_dir: "weights"
+
+# Stage1: 目标检测与几何校正
+stage1:
+  yolo:
+    weights_path: "weights/yolo/best.pt"  # YOLO detection weights path
+    device: "cuda"
+    confidence_threshold: 0.5
+    class_id_blank: 0
+    class_id_lit: 1
+  
+  geometry:
+    canvas_size: 600
+    slice_size: [80, 80]
+    ideal_center_gap: 60
+    ideal_chamber_step: 50
+    crop_radius: 25
+    class_id_blank: 0
+    class_id_lit: 1
+
+# Stage2: UNet光照校正
+stage2:
+  model:
+    model_type: "dual_stream"
+    in_channels: 3
+    out_channels: 3
+    features: [64, 128, 256, 512]
+    device: "cuda"
+  
+  loss:
+    roi_radius: 20
+    edge_weight: 0.1
+    lambda_cos: 0.2
+  
+  weights_path: "weights/unet/best_model.pth"  # UNet correction weights path
+  
+  # 训练数据配置（用于对比实验）
+  reference_chambers: [0, 1, 2]  # 基准腔室索引：[0]=仅空白腔, [0,1,2]=3个基准腔
+  reference_mode: "stack"         # 组合模式：stack=堆叠, average=平均
