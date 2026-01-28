@@ -1,0 +1,47 @@
+# 消融实验 B - 纯真实数据
+# 目的：验证 Sim-to-Real 数据策略有效性
+# 预期：可能因数据量不足而过拟合
+
+experiment_name: "ablation_b_real"
+experiment_type: "ablation_b"
+description: "仅使用真实数据训练（约270组）"
+
+# Stage2 配置
+stage2:
+  model:
+    model_type: "dual_stream"
+    in_channels: 3
+    out_channels: 3
+    features: [64, 128, 256, 512]
+  
+  loss:
+    roi_radius: 20
+    edge_weight: 0.1
+    lambda_cos: 0.2
+
+# 训练配置
+training:
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 5
+  
+  # 关键差异：仅真实数据
+  data_source: "real"
+  data_path: "data/real_training.npz"
+  val_split: 0.2
+
+# 评估配置
+evaluation:
+  test_split: 0.2
+  test_data_path: "data/real_test.npz"
+  metrics:
+    - psnr
+    - ssim
+    - rmse
+    - cosine_sim
+    - roi_rmse
+    - edge_rmse
+  roi_radius: 20

@@ -1,0 +1,45 @@
+# 消融实验 A - 双流模型 (Our Method)
+# 目的：作为对照组，验证 Reference Stream 的必要性
+
+experiment_name: "ablation_a_dual"
+experiment_type: "ablation_a"
+description: "双流 UNet (RefGuidedUNet) - 包含 Reference Encoder"
+
+# Stage2 配置
+stage2:
+  model:
+    model_type: "dual_stream"  # 使用 RefGuidedUNet
+    in_channels: 3
+    out_channels: 3
+    features: [64, 128, 256, 512]
+  
+  loss:
+    roi_radius: 20
+    edge_weight: 0.1
+    lambda_cos: 0.2
+
+# 训练配置
+training:
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 5
+  
+  # 数据配置
+  data_source: "mixed"
+  data_path: "data/training.npz"
+  val_split: 0.2
+
+# 评估配置
+evaluation:
+  test_split: 0.2
+  metrics:
+    - psnr
+    - ssim
+    - rmse
+    - cosine_sim
+    - roi_rmse
+    - edge_rmse
+  roi_radius: 20

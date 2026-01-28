@@ -84,7 +84,7 @@ def process_chip_directory(
         return []
     
     # 几何变换 GT（使用独立引擎）
-    gt_engine = CrossGeometryEngine(config.geometry)
+    gt_engine = CrossGeometryEngine(config.stage1.geometry)
     _, gt_slices, _, gt_debug = gt_engine.process(gt_image, detections_gt)
     
     if gt_slices is None or len(gt_slices) != 12:
@@ -99,7 +99,7 @@ def process_chip_directory(
     # ==================== 提取基准腔室（可配置） ====================
     # 从配置读取基准腔室索引
     ref_indices = config.stage2.reference_chambers if hasattr(config, 'stage2') else [0, 1, 2]
-    ref_mode = config.stage2.reference_mode if hasattr(config, 'stage2') else "stack"
+    ref_mode = config.stage2.reference_mode if hasattr(config, 'stage2') else "average"  # 默认改为average
     
     reference_slices = []
     for idx in ref_indices:
@@ -112,16 +112,24 @@ def process_chip_directory(
     
     logger.info(f"Using {len(reference_slices)} reference chambers: indices {ref_indices}, mode={ref_mode}")
     
-    # 根据模式组合基准腔室
+    # 根据模式组合基准腔室（最终输出必须是 (H, W, 3) 形状）
     if ref_mode == "average":
-        # 平均模式：所有基准腔室取平均
-        reference_combined = np.mean(reference_slices, axis=0, keepdims=True)  # (1, H, W, 3)
-    elif ref_mode == "stack":
-        # 堆叠模式：保持独立（默认）
-        reference_combined = np.stack(reference_slices, axis=0)  # (N_ref, H, W, 3)
+        # 平均模式：所有基准腔室取平均 → (H, W, 3)
+        reference_combined = np.mean(reference_slices, axis=0)  # 移除 keepdims
+    elif ref_mode == "median":
+        # 中值模式：取中值
+        reference_combined = np.median(reference_slices, axis=0)
+    elif ref_mode == "first":
+        # 仅使用第一个参考腔室
+        reference_combined = reference_slices[0]
     else:
-        # concat 或其他模式可在此扩展
-        reference_combined = np.stack(reference_slices, axis=0)
+        # 默认使用平均
+        logger.warning(f"Unknown ref_mode '{ref_mode}', falling back to 'average'")
+        reference_combined = np.mean(reference_slices, axis=0)
+    
+    # 验证形状（必须是单张图像）
+    assert reference_combined.shape == reference_slices[0].shape, \
+        f"Reference shape mismatch: {reference_combined.shape} vs {reference_slices[0].shape}"
     
     # ==================== 处理每个 Dirty 图像 ====================
     training_samples = []
@@ -199,8 +207,8 @@ def prepare_training_data(
     detector = ChamberDetector(config.stage1.yolo)
     logger.info("✓ Detector initialized")
     
-    # 收集所有芯片目录
-    chip_dirs = [d for d in dataset_dir.iterdir() if d.is_dir()]
+    # 收集所有芯片目录（排除隐藏目录）
+    chip_dirs = [d for d in dataset_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
     logger.info(f"Found {len(chip_dirs)} chip directories")
     
     # 处理每个芯片目录
@@ -216,21 +224,21 @@ def prepare_training_data(
     # ==================== 转换为NumPy数组 ====================
     logger.info(f"Converting {len(all_samples)} samples to NumPy arrays...")
     
-    signals = np.array([s['signal'] for s in all_samples], dtype=np.float32)
-    references = np.array([s['reference'] for s in all_samples], dtype=np.float32)
-    targets = np.array([s['target'] for s in all_samples], dtype=np.float32)
+    target_in = np.array([s['signal'] for s in all_samples], dtype=np.float32)      # 待校正图像
+    ref_in = np.array([s['reference'] for s in all_samples], dtype=np.float32)      # 参考图像
+    labels = np.array([s['target'] for s in all_samples], dtype=np.float32)          # 真值图像
     
-    logger.info(f"Signal shape:    {signals.shape}")      # (N, H, W, 3)
-    logger.info(f"Reference shape: {references.shape}")    # (N, 3, H, W, 3)
-    logger.info(f"Target shape:    {targets.shape}")       # (N, H, W, 3)
+    logger.info(f"Target-in shape:  {target_in.shape}")    # (N, H, W, 3)
+    logger.info(f"Ref-in shape:     {ref_in.shape}")       # (N, H, W, 3) - 修复后
+    logger.info(f"Labels shape:     {labels.shape}")       # (N, H, W, 3)
     
     # ==================== 保存到NPZ ====================
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        signals=signals,
-        references=references,
-        targets=targets
+        target_in=target_in,  # 修改key名
+        ref_in=ref_in,        # 修改key名
+        labels=labels         # 修改key名
     )
     
     logger.info(f"✓ Training data saved to: {output_path}")
