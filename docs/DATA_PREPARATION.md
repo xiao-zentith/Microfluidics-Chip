@@ -50,6 +50,21 @@ dataset/
 python scripts/prepare_training_data.py dataset/training -o data/training.npz
 ```
 
+### 使用离线增强 (v1.2)
+
+```bash
+# 5倍ISP增强 (推荐)
+python scripts/prepare_training_data.py dataset/training -o data/training.npz \
+    --augment --aug-multiplier 5
+```
+
+**增强内容**:
+- 光照场 (渐晕 + 方向性光源)
+- 白平衡漂移
+- 曝光变化
+- Gamma校正
+- Shot Noise (光子计数模型)
+
 ### 完整参数
 
 ```bash
@@ -57,6 +72,8 @@ python scripts/prepare_training_data.py \
     dataset/training \
     --output data/training.npz \
     --config configs/default.yaml \
+    --augment \
+    --aug-multiplier 5 \
     --no-debug
 ```
 
@@ -65,6 +82,8 @@ python scripts/prepare_training_data.py \
 | `dataset_dir` | 数据集根目录（位置参数） | - |
 | `-o, --output` | 输出NPZ文件路径 | `data/training.npz` |
 | `-c, --config` | 配置文件 | `None`（使用默认配置） |
+| `--augment` | 启用离线ISP增强 (v1.2) | 禁用 |
+| `--aug-multiplier` | 增强倍数 (1-10) | 5 |
 | `--no-debug` | 不保存调试图像 | 默认保存 |
 
 ### 输出文件

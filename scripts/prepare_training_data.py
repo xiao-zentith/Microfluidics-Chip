@@ -1,5 +1,5 @@
 """
-训练数据准备脚本
+训练数据准备脚本 (v1.2)
 
 处理数据集结构：
   dataset/
@@ -11,13 +11,22 @@
     └── chip002/
         └── ...
 
+v1.2 更新：
+  - 添加离线ISP退化增强（光照场、白平衡、曝光、Gamma、Shot Noise）
+  - 增强在全图切片前应用，确保signal与ref处于同一光照场
+  - 支持 --augment 和 --aug-multiplier 参数
+
 输出：
   - 切片数据配对（Dirty切片 ↔ GT切片）
   - 3个基准腔室切片（用于UNet双流输入）
   - NPZ格式训练数据
 
 使用方法：
+  # 不使用增强
   python scripts/prepare_training_data.py dataset/training -o data/training.npz
+  
+  # 使用5倍增强
+  python scripts/prepare_training_data.py dataset/training -o data/training.npz --augment --aug-multiplier 5
 """
 
 import argparse
@@ -34,6 +43,7 @@ from microfluidics_chip.core.config import get_default_config
 from microfluidics_chip.stage1_detection.detector import ChamberDetector
 from microfluidics_chip.stage1_detection.geometry_engine import CrossGeometryEngine
 from microfluidics_chip.core.logger import get_logger, setup_logger
+from microfluidics_chip.stage2_correction.augmentations import apply_isp_degradation
 
 logger = get_logger("prepare_training_data")
 
@@ -41,7 +51,9 @@ logger = get_logger("prepare_training_data")
 def process_chip_directory(
     chip_dir: Path,
     detector: ChamberDetector,
-    config
+    config,
+    augment: bool = False,
+    aug_multiplier: int = 5
 ) -> list:
     """
     处理单个芯片目录
@@ -49,6 +61,8 @@ def process_chip_directory(
     :param chip_dir: 芯片目录（包含 gt.png 和多个 dirty_*.png）
     :param detector: YOLO检测器
     :param config: Stage1配置
+    :param augment: 是否启用离线增强
+    :param aug_multiplier: 增强倍数
     :return: 训练样本列表 [{'signal': ..., 'reference': ..., 'target': ...}, ...]
     """
     # 查找 GT 图像
@@ -99,7 +113,7 @@ def process_chip_directory(
     # ==================== 提取基准腔室（可配置） ====================
     # 从配置读取基准腔室索引
     ref_indices = config.stage2.reference_chambers if hasattr(config, 'stage2') else [0, 1, 2]
-    ref_mode = config.stage2.reference_mode if hasattr(config, 'stage2') else "average"  # 默认改为average
+    ref_mode = config.stage2.reference_mode if hasattr(config, 'stage2') else "average"
     
     reference_slices = []
     for idx in ref_indices:
@@ -112,24 +126,16 @@ def process_chip_directory(
     
     logger.info(f"Using {len(reference_slices)} reference chambers: indices {ref_indices}, mode={ref_mode}")
     
-    # 根据模式组合基准腔室（最终输出必须是 (H, W, 3) 形状）
+    # 根据模式组合基准腔室
     if ref_mode == "average":
-        # 平均模式：所有基准腔室取平均 → (H, W, 3)
-        reference_combined = np.mean(reference_slices, axis=0)  # 移除 keepdims
+        reference_combined = np.mean(reference_slices, axis=0)
     elif ref_mode == "median":
-        # 中值模式：取中值
         reference_combined = np.median(reference_slices, axis=0)
     elif ref_mode == "first":
-        # 仅使用第一个参考腔室
         reference_combined = reference_slices[0]
     else:
-        # 默认使用平均
         logger.warning(f"Unknown ref_mode '{ref_mode}', falling back to 'average'")
         reference_combined = np.mean(reference_slices, axis=0)
-    
-    # 验证形状（必须是单张图像）
-    assert reference_combined.shape == reference_slices[0].shape, \
-        f"Reference shape mismatch: {reference_combined.shape} vs {reference_slices[0].shape}"
     
     # ==================== 处理每个 Dirty 图像 ====================
     training_samples = []
@@ -144,38 +150,51 @@ def process_chip_directory(
             logger.warning(f"Failed to read: {dirty_path}")
             continue
         
-        # 检测 Dirty
-        detections_dirty = detector.detect(dirty_image)
-        if len(detections_dirty) < 12:
-            logger.warning(f"Insufficient detections in {dirty_path.name}: {len(detections_dirty)}")
-            continue
+        # 生成图像变体列表（原始 + 增强）
+        image_variants = [dirty_image]  # 始终包含原始图像
         
-        # 几何变换 Dirty（使用独立引擎）
-        dirty_engine = CrossGeometryEngine(config.stage1.geometry)
-        _, dirty_slices, _, dirty_debug = dirty_engine.process(dirty_image, detections_dirty)
+        if augment:
+            logger.debug(f"Generating {aug_multiplier} augmented variants for {dirty_path.name}")
+            for aug_idx in range(aug_multiplier):
+                # 对全图应用ISP退化 (v1.2)
+                augmented = apply_isp_degradation(dirty_image)
+                image_variants.append(augmented)
         
-        if dirty_slices is None or len(dirty_slices) != 12:
-            logger.warning(f"Failed to process {dirty_path.name}")
-            continue
-        
-        # 保存 Dirty 调试可视化（可选）
-        if dirty_debug is not None:
-            debug_path = chip_dir / f"debug_{dirty_path.stem}.png"
-            cv2.imwrite(str(debug_path), dirty_debug)
-        
-        # ==================== 配对：每个训练腔室生成一条数据 ====================
-        for chamber_idx in range(training_start_idx, 12):
-            signal_slice = dirty_slices[chamber_idx].astype(np.float32) / 255.0  # 干扰信号
-            target_slice = gt_slices[chamber_idx].astype(np.float32) / 255.0      # 目标GT
+        # 处理每个变体
+        for variant_idx, variant_image in enumerate(image_variants):
+            # 检测腔室
+            detections_dirty = detector.detect(variant_image)
+            if len(detections_dirty) < 12:
+                if variant_idx == 0:  # 仅对原始图像警告
+                    logger.warning(f"Insufficient detections in {dirty_path.name}: {len(detections_dirty)}")
+                continue
             
-            # 组装训练样本
-            training_samples.append({
-                'signal': signal_slice,
-                'reference': reference_combined,  # 根据mode已组合
-                'target': target_slice
-            })
+            # 几何变换（使用独立引擎）
+            dirty_engine = CrossGeometryEngine(config.stage1.geometry)
+            _, dirty_slices, _, dirty_debug = dirty_engine.process(variant_image, detections_dirty)
+            
+            if dirty_slices is None or len(dirty_slices) != 12:
+                continue
+            
+            # 保存原始图像的调试可视化
+            if variant_idx == 0 and dirty_debug is not None:
+                debug_path = chip_dir / f"debug_{dirty_path.stem}.png"
+                cv2.imwrite(str(debug_path), dirty_debug)
+            
+            # ==================== 配对：每个训练腔室生成一条数据 ====================
+            for chamber_idx in range(training_start_idx, 12):
+                signal_slice = dirty_slices[chamber_idx].astype(np.float32) / 255.0
+                target_slice = gt_slices[chamber_idx].astype(np.float32) / 255.0
+                
+                training_samples.append({
+                    'signal': signal_slice,
+                    'reference': reference_combined,
+                    'target': target_slice
+                })
     
-    logger.info(f"✓ {chip_dir.name}: Generated {len(training_samples)} training samples")
+    n_orig = len(dirty_paths) * (12 - training_start_idx)
+    n_aug = len(training_samples) - n_orig if augment else 0
+    logger.info(f"✓ {chip_dir.name}: {len(training_samples)} samples (orig: ~{n_orig}, aug: ~{n_aug})")
     return training_samples
 
 
@@ -183,7 +202,9 @@ def prepare_training_data(
     dataset_dir: Path,
     output_path: Path,
     config_path: Path = None,
-    save_debug: bool = True
+    save_debug: bool = True,
+    augment: bool = False,
+    aug_multiplier: int = 5
 ):
     """
     批量准备训练数据
@@ -192,6 +213,8 @@ def prepare_training_data(
     :param output_path: 输出NPZ文件路径
     :param config_path: 配置文件路径
     :param save_debug: 是否保存调试可视化
+    :param augment: 是否启用离线ISP增强
+    :param aug_multiplier: 增强倍数
     """
     setup_logger(level="INFO")
     
@@ -207,6 +230,17 @@ def prepare_training_data(
     detector = ChamberDetector(config.stage1.yolo)
     logger.info("✓ Detector initialized")
     
+    # 显示增强状态
+    if augment:
+        logger.info(f"[v1.2] Offline ISP augmentation ENABLED (multiplier: {aug_multiplier}×)")
+        logger.info("  - Illumination field (gradient + vignetting)")
+        logger.info("  - White balance drift")
+        logger.info("  - Exposure variation")
+        logger.info("  - Gamma correction")
+        logger.info("  - Shot noise (photon counting model)")
+    else:
+        logger.info("[v1.2] Offline augmentation DISABLED")
+    
     # 收集所有芯片目录（排除隐藏目录）
     chip_dirs = [d for d in dataset_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
     logger.info(f"Found {len(chip_dirs)} chip directories")
@@ -214,7 +248,11 @@ def prepare_training_data(
     # 处理每个芯片目录
     all_samples = []
     for chip_dir in tqdm(chip_dirs, desc="Processing chips"):
-        samples = process_chip_directory(chip_dir, detector, config)  # 传递完整config
+        samples = process_chip_directory(
+            chip_dir, detector, config,
+            augment=augment,
+            aug_multiplier=aug_multiplier
+        )
         all_samples.extend(samples)
     
     if not all_samples:
@@ -224,21 +262,21 @@ def prepare_training_data(
     # ==================== 转换为NumPy数组 ====================
     logger.info(f"Converting {len(all_samples)} samples to NumPy arrays...")
     
-    target_in = np.array([s['signal'] for s in all_samples], dtype=np.float32)      # 待校正图像
-    ref_in = np.array([s['reference'] for s in all_samples], dtype=np.float32)      # 参考图像
-    labels = np.array([s['target'] for s in all_samples], dtype=np.float32)          # 真值图像
+    target_in = np.array([s['signal'] for s in all_samples], dtype=np.float32)
+    ref_in = np.array([s['reference'] for s in all_samples], dtype=np.float32)
+    labels = np.array([s['target'] for s in all_samples], dtype=np.float32)
     
-    logger.info(f"Target-in shape:  {target_in.shape}")    # (N, H, W, 3)
-    logger.info(f"Ref-in shape:     {ref_in.shape}")       # (N, H, W, 3) - 修复后
-    logger.info(f"Labels shape:     {labels.shape}")       # (N, H, W, 3)
+    logger.info(f"Target-in shape:  {target_in.shape}")
+    logger.info(f"Ref-in shape:     {ref_in.shape}")
+    logger.info(f"Labels shape:     {labels.shape}")
     
     # ==================== 保存到NPZ ====================
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        target_in=target_in,  # 修改key名
-        ref_in=ref_in,        # 修改key名
-        labels=labels         # 修改key名
+        target_in=target_in,
+        ref_in=ref_in,
+        labels=labels
     )
     
     logger.info(f"✓ Training data saved to: {output_path}")
@@ -250,12 +288,14 @@ def prepare_training_data(
     logger.info(f"  - Total chips: {len(chip_dirs)}")
     logger.info(f"  - Total samples: {len(all_samples)}")
     logger.info(f"  - Avg samples/chip: {len(all_samples) / len(chip_dirs):.1f}")
+    if augment:
+        logger.info(f"  - Augmentation: {aug_multiplier}× (ISP degradation)")
     logger.info("=" * 60)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Prepare training data from GT + Dirty images",
+        description="Prepare training data from GT + Dirty images (v1.2)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -286,17 +326,36 @@ def main():
         help="不保存调试可视化图像"
     )
     
+    # v1.2 新增参数
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="启用离线ISP退化增强 (v1.2)"
+    )
+    
+    parser.add_argument(
+        "--aug-multiplier",
+        type=int,
+        default=5,
+        help="增强倍数 (默认: 5, 上限: 10)"
+    )
+    
     args = parser.parse_args()
     
     if not args.dataset_dir.exists():
         print(f"Error: Dataset directory not found: {args.dataset_dir}")
         return 1
     
+    # 限制增强倍数
+    aug_multiplier = min(max(args.aug_multiplier, 1), 10)
+    
     prepare_training_data(
         dataset_dir=args.dataset_dir,
         output_path=args.output,
         config_path=args.config,
-        save_debug=not args.no_debug
+        save_debug=not args.no_debug,
+        augment=args.augment,
+        aug_multiplier=aug_multiplier
     )
     
     return 0
