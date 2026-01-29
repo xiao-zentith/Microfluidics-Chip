@@ -10,17 +10,17 @@
 
 ```
 dataset/
-├── chip001/                    # 第1个芯片
-│   ├── gt.png                  # Ground Truth（理想条件，必需）
-│   ├── dirty_01.png            # 有光照干扰的图像1
-│   ├── dirty_02.png            # 有光照干扰的图像2
-│   ├── dirty_03.png            # ...
-│   └── ...
-├── chip002/                    # 第2个芯片
-│   ├── GT.png                  # 大小写均可
-│   ├── noisy_01.png            # noisy_* 命名也支持
-│   └── ...
-└── chip003/
+├── training/                   # 训练集目录
+│   ├── chip001/                # 第1个芯片
+│   │   ├── gt.png              # Ground Truth
+│   │   ├── dirty_01.png        # 干扰图像
+│   │   └── ...
+│   └── chip002/
+│       └── ...
+└── test/                       # 测试集目录
+    ├── chip003/
+    │   ├── gt.png
+    │   └── ...
     └── ...
 ```
 
@@ -42,19 +42,43 @@ dataset/
 
 ---
 
+## 🛠️ (可选) 辅助工具：一键重命名
+
+如果你拍摄的照片文件名杂乱（例如 `IMG_2023.jpg`, `DSC_001.jpg`），可以使用 `scripts/rename_dataset.py` 脚本一键标准化命名。
+
+### 功能
+- 自动识别 GT 图像（根据文件名关键词或文件大小）
+- 自动将其余图像重命名为 `dirty_01.jpg`, `dirty_02.jpg`...
+- 自动备份原始文件名
+
+### 用法
+
+```bash
+# 1. 预览重命名计划（DRY-RUN，不执行）
+python scripts/rename_dataset.py dataset/chip001 --dry-run
+
+# 2. 执行重命名
+python scripts/rename_dataset.py dataset/chip001
+
+# 3. 如果自动识别GT错误，手动指定
+python scripts/rename_dataset.py dataset/chip001 --gt-image IMG_9999.jpg
+```
+
+---
+
 ## 🔧 第二步：运行数据准备脚本
 
 ### 基础用法
 
 ```bash
-python scripts/prepare_training_data.py dataset/training -o data/training.npz
+python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz
 ```
 
 ### 使用离线增强 (v1.2)
 
 ```bash
 # 5倍ISP增强 (推荐)
-python scripts/prepare_training_data.py dataset/training -o data/training.npz \
+python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz \
     --augment --aug-multiplier 5
 ```
 
@@ -70,7 +94,7 @@ python scripts/prepare_training_data.py dataset/training -o data/training.npz \
 ```bash
 python scripts/prepare_training_data.py \
     dataset/training \
-    --output data/training.npz \
+    --output processed_data/training.npz \
     --config configs/default.yaml \
     --augment \
     --aug-multiplier 5 \
@@ -80,7 +104,7 @@ python scripts/prepare_training_data.py \
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `dataset_dir` | 数据集根目录（位置参数） | - |
-| `-o, --output` | 输出NPZ文件路径 | `data/training.npz` |
+| `-o, --output` | 输出NPZ文件路径 | `processed_data/training.npz` |
 | `-c, --config` | 配置文件 | `None`（使用默认配置） |
 | `--augment` | 启用离线ISP增强 (v1.2) | 禁用 |
 | `--aug-multiplier` | 增强倍数 (1-10) | 5 |
@@ -90,7 +114,7 @@ python scripts/prepare_training_data.py \
 
 | 文件 | 说明 |
 |------|------|
-| `data/training.npz` | 训练数据（target_in, ref_in, labels） |
+| `processed_data/training.npz` | 训练数据（target_in, ref_in, labels） |
 | `chip*/debug_gt.png` | GT图像的检测+几何校正可视化（调试用） |
 | `chip*/debug_dirty_*.png` | Dirty图像的可视化（调试用） |
 
@@ -104,7 +128,7 @@ python scripts/prepare_training_data.py \
 
 **验证数据格式：**
 ```bash
-python scripts/verify_npz_format.py data/training.npz
+python scripts/verify_npz_format.py processed_data/training.npz
 ```
 
 ---
@@ -114,12 +138,12 @@ python scripts/verify_npz_format.py data/training.npz
 ### 日常训练（推荐）
 
 ```bash
-python scripts/train_stage2.py data/training.npz -o runs/my_training -e 100
+python scripts/train_stage2.py processed_data/training.npz -o runs/my_training -e 100
 ```
 
 **参数说明：**
 ```bash
-python scripts/train_stage2.py data/training.npz \
+python scripts/train_stage2.py processed_data/training.npz \
     --output runs/my_training \
     --epochs 100 \
     --batch-size 32 \
@@ -161,7 +185,7 @@ runs/my_training/
 ### 准备测试集
 
 ```bash
-python scripts/prepare_training_data.py dataset/test -o data/test.npz
+python scripts/prepare_training_data.py dataset/test -o processed_data/test.npz
 ```
 
 ### 评估单个模型
@@ -169,7 +193,7 @@ python scripts/prepare_training_data.py dataset/test -o data/test.npz
 ```bash
 python scripts/evaluate_experiments.py \
     -e runs/my_training \
-    -t data/test.npz \
+    -t processed_data/test.npz \
     -o results/evaluation.json
 ```
 
@@ -178,7 +202,7 @@ python scripts/evaluate_experiments.py \
 ```bash
 python scripts/evaluate_experiments.py \
     -e runs/exp_dual runs/exp_single \
-    -t data/test.npz \
+    -t processed_data/test.npz \
     -o results/comparison.json
 ```
 
@@ -288,19 +312,19 @@ stage2:
 
 ```bash
 # 1. 准备训练数据
-python scripts/prepare_training_data.py dataset/training -o data/train.npz
+python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz
 
 # 2. 验证数据格式
-python scripts/verify_npz_format.py data/train.npz
+python scripts/verify_npz_format.py processed_data/training.npz
 
 # 3. 训练模型
-python scripts/train_stage2.py data/train.npz -o runs/exp1 -e 100
+python scripts/train_stage2.py processed_data/training.npz -o runs/exp1 -e 100
 
 # 4. 准备测试数据
-python scripts/prepare_training_data.py dataset/test -o data/test.npz
+python scripts/prepare_training_data.py dataset/test -o processed_data/test.npz
 
 # 5. 评估
-python scripts/evaluate_experiments.py -e runs/exp1 -t data/test.npz -o results/eval.json
+python scripts/evaluate_experiments.py -e runs/exp1 -t processed_data/test.npz -o results/eval.json
 
 # 6. 查看结果
 cat results/eval.md

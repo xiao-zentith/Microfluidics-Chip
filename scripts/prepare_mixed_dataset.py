@@ -14,7 +14,7 @@
   python scripts/prepare_mixed_dataset.py \
     --real dataset/real_training \
     --synthetic dataset/clean_images \
-    --output data/mixed_training.npz \
+    --output processed_data/mixed_training.npz \
     --synthetic-multiplier 50
 """
 

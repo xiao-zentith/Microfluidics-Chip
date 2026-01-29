@@ -4,6 +4,10 @@ Stage2 UNet 训练脚本
 使用合成数据训练光照校正模型
 """
 
+import os
+# 修复 OpenMP 运行时冲突错误 (OMP: Error #15)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
@@ -25,12 +29,12 @@ logger = get_logger("scripts.train_stage2")
 def main(
     npz_path: Path = typer.Argument(..., help="合成数据npz文件路径"),
     output_dir: Path = typer.Option("runs/stage2_training", "--output", "-o", help="训练输出目录"),
-    epochs: int = typer.Option(100, "--epochs", "-e", help="训练轮数"),
+    epochs: int = typer.Option(300, "--epochs", "-e", help="训练轮数"),
     batch_size: int = typer.Option(32, "--batch-size", "-b", help="批次大小"),
     lr: float = typer.Option(1e-4, "--lr", help="学习率"),
     device: str = typer.Option("cuda", "--device", "-d", help="设备 (cuda/cpu)"),
     roi_radius: int = typer.Option(20, "--roi-radius", help="ROI半径"),
-    edge_weight: float = typer.Option(0.1, "--edge-weight", help="边缘权重"),
+    edge_weight: float = typer.Option(0.3, "--edge-weight", help="边缘权重"),
     lambda_cos: float = typer.Option(0.2, "--lambda-cos", help="余弦损失权重"),
     num_workers: int = typer.Option(4, "--workers", "-w", help="数据加载器线程数"),
     visualize_every: int = typer.Option(5, "--visualize-every", help="可视化间隔"),
@@ -40,8 +44,8 @@ def main(
     训练 Stage2 UNet 模型
     
     示例：
-        python scripts/train_stage2.py data/synthetic_data.npz -o runs/training
-        python scripts/train_stage2.py data/synthetic_data.npz --epochs 200 --batch-size 64
+        python scripts/train_stage2.py processed_data/synthetic_data.npz -o runs/training
+        python scripts/train_stage2.py processed_data/synthetic_data.npz --epochs 200 --batch-size 64
     """
     # 设置日志
     log_level = "DEBUG" if verbose else "INFO"

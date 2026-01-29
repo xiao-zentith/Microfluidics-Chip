@@ -38,17 +38,17 @@
 
 ```bash
 # 不使用增强
-python scripts/prepare_training_data.py dataset/training -o data/training.npz
+python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz
 
 # 使用5倍ISP增强
-python scripts/prepare_training_data.py dataset/training -o data/training.npz \
+python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz \
     --augment --aug-multiplier 5
 ```
 
 ### 2. 训练（在线几何增强）
 
 ```bash
-python scripts/train_stage2.py data/training.npz -o runs/model \
+python scripts/train_stage2.py processed_data/training.npz -o runs/model \
     --augment  # 启用在线几何增强
 ```
 

@@ -41,6 +41,7 @@ outputs/
 
 # Data directories
 data/
+processed_data/
 dataset/
 
 # Torch cache

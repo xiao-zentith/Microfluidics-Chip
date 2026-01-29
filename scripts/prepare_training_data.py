@@ -23,11 +23,15 @@ v1.2 更新：
 
 使用方法：
   # 不使用增强
-  python scripts/prepare_training_data.py dataset/training -o data/training.npz
+  python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz
   
   # 使用5倍增强
-  python scripts/prepare_training_data.py dataset/training -o data/training.npz --augment --aug-multiplier 5
+  python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz --augment --aug-multiplier 5
 """
+
+import os
+# 修复 OpenMP 运行时冲突错误 (OMP: Error #15)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import argparse
 import cv2
@@ -309,8 +313,8 @@ def main():
     parser.add_argument(
         "-o", "--output",
         type=Path,
-        default=Path("data/training.npz"),
-        help="输出NPZ文件路径（默认: data/training.npz）"
+        default=Path("processed_data/training.npz"),
+        help="输出NPZ文件路径（默认: processed_data/training.npz）"
     )
     
     parser.add_argument(
