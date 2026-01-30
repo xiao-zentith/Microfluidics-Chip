@@ -36,13 +36,10 @@ weights/
 *.hdf5
 
 # Training and inference outputs
-runs/
 outputs/
 
-# Data directories
+# Data directories (unified)
 data/
-processed_data/
-dataset/
 
 # Torch cache
 .torch/
