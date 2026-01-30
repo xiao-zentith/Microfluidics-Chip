@@ -9,19 +9,28 @@
 ### 要求的目录结构
 
 ```
-dataset/
-├── training/                   # 训练集目录
-│   ├── chip001/                # 第1个芯片
-│   │   ├── gt.png              # Ground Truth
-│   │   ├── dirty_01.png        # 干扰图像
-│   │   └── ...
-│   └── chip002/
-│       └── ...
-└── test/                       # 测试集目录
-    ├── chip003/
-    │   ├── gt.png
-    │   └── ...
-    └── ...
+data/
+├── raw/                         # 原始拍摄数据
+│   └── microfluidics_v1/       # 数据集名称（可根据实验版本命名）
+│       ├── training/           # 训练集目录
+│       │   ├── chip001/        # 第1个芯片
+│       │   │   ├── gt.png      # Ground Truth
+│       │   │   ├── dirty_01.png # 干扰图像
+│       │   │   └── ...
+│       │   └── chip002/
+│       │       └── ...
+│       └── test/               # 测试集目录
+│           ├── chip003/
+│           │   ├── gt.png
+│           │   └── ...
+│           └── ...
+├── processed/                  # 预处理后的NPZ文件
+│   └── microfluidics_v1/
+│       ├── training.npz
+│       └── test.npz
+└── experiments/                # 训练输出
+    ├── 2024-01-30_baseline/
+    └── 2024-01-31_augmented/
 ```
 
 ### 命名规则
@@ -71,14 +80,14 @@ python scripts/rename_dataset.py dataset/chip001 --gt-image IMG_9999.jpg
 ### 基础用法
 
 ```bash
-python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz
+python scripts/prepare_training_data.py data/raw/microfluidics_v1/training -o data/processed/microfluidics_v1/training.npz
 ```
 
 ### 使用离线增强 (v1.2)
 
 ```bash
 # 5倍ISP增强 (推荐)
-python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz \
+python scripts/prepare_training_data.py data/raw/microfluidics_v1/training -o data/processed/microfluidics_v1/training.npz \
     --augment --aug-multiplier 5
 ```
 
@@ -93,8 +102,8 @@ python scripts/prepare_training_data.py dataset/training -o processed_data/train
 
 ```bash
 python scripts/prepare_training_data.py \
-    dataset/training \
-    --output processed_data/training.npz \
+    data/raw/microfluidics_v1/training \
+    --output data/processed/microfluidics_v1/training.npz \
     --config configs/default.yaml \
     --augment \
     --aug-multiplier 5 \
@@ -114,7 +123,7 @@ python scripts/prepare_training_data.py \
 
 | 文件 | 说明 |
 |------|------|
-| `processed_data/training.npz` | 训练数据（target_in, ref_in, labels） |
+| `data/processed/microfluidics_v1/training.npz` | 训练数据（target_in, ref_in, labels） |
 | `chip*/debug_gt.png` | GT图像的检测+几何校正可视化（调试用） |
 | `chip*/debug_dirty_*.png` | Dirty图像的可视化（调试用） |
 

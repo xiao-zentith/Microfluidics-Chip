@@ -56,4 +56,4 @@ def check_data(npz_path):
     print("Please check 'Overlay' and 'Difference' for misalignment.")
 
 if __name__ == "__main__":
-    check_data("processed_data/training.npz")
+    check_data("data/processed/microfluidics_v1/training.npz")

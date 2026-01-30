@@ -62,21 +62,21 @@ weights/
 # Stage1: 检测与切片
 python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
-  -o runs/stage1
+  -o data/experiments/stage1
 
 # Stage2: 光照校正
 python -m microfluidics_chip.pipelines.cli stage2 \
-  runs/stage1/chip001 \
-  -o runs/stage2
+  data/experiments/stage1/chip001 \
+  -o data/experiments/stage2
 
 # 批量处理
 python -m microfluidics_chip.pipelines.cli stage1-batch \
   data/images \
-  -o runs/batch_stage1
+  -o data/experiments/batch_stage1
 
 python -m microfluidics_chip.pipelines.cli stage2-batch \
-  runs/batch_stage1 \
-  -o runs/batch_stage2
+  data/experiments/batch_stage1 \
+  -o data/experiments/batch_stage2
 ```
 
 ---
@@ -95,19 +95,19 @@ python -m microfluidics_chip.pipelines.cli stage1 IMAGE_PATH -o OUTPUT_DIR
 python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
   --gt data/chip001_gt.png \
-  -o runs/stage1
+  -o data/experiments/stage1
 
 # 调试模式（保存检测可视化和单个切片）
 python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
-  -o runs/debug \
+  -o data/experiments/debug \
   --save-slices \
   --save-debug
 
 # 使用自定义配置
 python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
-  -o runs/stage1 \
+  -o data/experiments/stage1 \
   --config configs/my_config.yaml
 ```
 
@@ -116,13 +116,13 @@ python -m microfluidics_chip.pipelines.cli stage1 \
 ```bash
 # 基本用法（P2 规范：只接受 stage1_run_dir）
 python -m microfluidics_chip.pipelines.cli stage2 \
-  runs/stage1/chip001 \
-  -o runs/stage2
+  data/experiments/stage1/chip001 \
+  -o data/experiments/stage2
 
 # 批量处理
 python -m microfluidics_chip.pipelines.cli stage2-batch \
-  runs/stage1 \
-  -o runs/stage2
+  data/experiments/stage1 \
+  -o data/experiments/stage2
 ```
 
 ### Python API

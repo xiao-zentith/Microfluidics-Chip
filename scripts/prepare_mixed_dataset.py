@@ -12,9 +12,9 @@
 
 使用方法：
   python scripts/prepare_mixed_dataset.py \
-    --real dataset/real_training \
-    --synthetic dataset/clean_images \
-    --output processed_data/mixed_training.npz \
+    --real data/raw/microfluidics_v1/training \
+    --synthetic data/raw/clean_images \
+    --output data/processed/microfluidics_v1/mixed_training.npz \
     --synthetic-multiplier 50
 """
 

@@ -28,7 +28,7 @@ logger = get_logger("scripts.train_stage2")
 @app.command()
 def main(
     npz_path: Path = typer.Argument(..., help="合成数据npz文件路径"),
-    output_dir: Path = typer.Option("runs/stage2_training", "--output", "-o", help="训练输出目录"),
+    output_dir: Path = typer.Option("data/experiments/stage2_training", "--output", "-o", help="训练输出目录"),
     epochs: int = typer.Option(300, "--epochs", "-e", help="训练轮数"),
     batch_size: int = typer.Option(32, "--batch-size", "-b", help="批次大小"),
     lr: float = typer.Option(1e-4, "--lr", help="学习率"),
@@ -44,8 +44,8 @@ def main(
     训练 Stage2 UNet 模型
     
     示例：
-        python scripts/train_stage2.py processed_data/synthetic_data.npz -o runs/training
-        python scripts/train_stage2.py processed_data/synthetic_data.npz --epochs 200 --batch-size 64
+        python scripts/train_stage2.py data/processed/microfluidics_v1/training.npz -o data/experiments/baseline
+        python scripts/train_stage2.py data/processed/microfluidics_v1/training.npz --epochs 200 --batch-size 64
     """
     # 设置日志
     log_level = "DEBUG" if verbose else "INFO"

@@ -23,10 +23,10 @@ v1.2 更新：
 
 使用方法：
   # 不使用增强
-  python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz
+  python scripts/prepare_training_data.py data/raw/microfluidics_v1/training -o data/processed/microfluidics_v1/training.npz
   
   # 使用5倍增强
-  python scripts/prepare_training_data.py dataset/training -o processed_data/training.npz --augment --aug-multiplier 5
+  python scripts/prepare_training_data.py data/raw/microfluidics_v1/training -o data/processed/microfluidics_v1/training.npz --augment --aug-multiplier 5
 """
 
 import os
@@ -313,8 +313,8 @@ def main():
     parser.add_argument(
         "-o", "--output",
         type=Path,
-        default=Path("processed_data/training.npz"),
-        help="输出NPZ文件路径（默认: processed_data/training.npz）"
+        default=Path("data/processed/microfluidics_v1/training.npz"),
+        help="输出NPZ文件路径（默认: data/processed/microfluidics_v1/training.npz）"
     )
     
     parser.add_argument(
