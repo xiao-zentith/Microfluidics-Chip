@@ -6,6 +6,8 @@ experiment_name: "microfluidics_default"
 # 路径配置
 paths:
   data_dir: "data"
+  stage1_data: "data/stage1_detection"    # Stage1 YOLO训练数据
+  stage2_data: "data/stage2_correction"   # Stage2 UNet训练数据
   runs_dir: "runs"
   weights_dir: "weights"
 

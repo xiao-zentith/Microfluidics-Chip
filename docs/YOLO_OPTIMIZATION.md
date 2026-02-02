@@ -150,7 +150,7 @@ transform = A.Compose([
 ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
 # 对每张图像生成5个增强版本
-for img_path in Path("yolo_dataset/images").glob("*.png"):
+for img_path in Path("data/stage1_detection/yolo_v1/images").glob("*.png"):
     img = cv2.imread(str(img_path))
     
     # 读取对应的标注
@@ -194,7 +194,7 @@ mixup: 0.1    # MixUp增强
 ### 4.1 收集多光照条件数据
 
 ```
-yolo_dataset/
+data/stage1_detection/yolo_v1/
 ├── bright/     # 强光条件
 ├── normal/     # 正常光照
 ├── dark/       # 弱光条件
@@ -247,7 +247,7 @@ def simulate_lighting_variations(img):
 ### 5.1 准备数据集
 
 ```
-yolo_dataset/
+data/stage1_detection/yolo_v1/
 ├── images/
 │   ├── train/
 │   │   ├── chip001.png
@@ -307,7 +307,7 @@ model.export(format='onnx')  # 可选：导出为ONNX加速推理
 
 **数据集配置** (`yolo_data.yaml`):
 ```yaml
-path: /path/to/yolo_dataset
+path: data/stage1_detection/yolo_v1
 train: images/train
 val: images/val
 

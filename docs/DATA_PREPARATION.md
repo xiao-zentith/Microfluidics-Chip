@@ -10,25 +10,29 @@
 
 ```
 data/
-├── raw/                         # 原始拍摄数据
-│   └── microfluidics_v1/       # 数据集名称（可根据实验版本命名）
-│       ├── training/           # 训练集目录
-│       │   ├── chip001/        # 第1个芯片
-│       │   │   ├── gt.png      # Ground Truth
-│       │   │   ├── dirty_01.png # 干扰图像
-│       │   │   └── ...
-│       │   └── chip002/
-│       │       └── ...
-│       └── test/               # 测试集目录
-│           ├── chip003/
-│           │   ├── gt.png
-│           │   └── ...
-│           └── ...
-├── processed/                  # 预处理后的NPZ文件
-│   └── microfluidics_v1/
-│       ├── training.npz
-│       └── test.npz
-└── experiments/                # 训练输出
+├── stage1_detection/            # Stage1: YOLO 目标检测数据（独立管理）
+│   └── yolo_v1/                 # YOLO 数据集版本 1
+│       ├── images/
+│       │   ├── train/
+│       │   └── val/
+│       ├── labels/
+│       │   ├── train/
+│       │   └── val/
+│       └── data.yaml
+│
+├── stage2_correction/           # Stage2: UNet 光照校正数据（独立管理）
+│   ├── raw/                     # 原始拍摄数据
+│   │   ├── chip001/             # 第1个芯片
+│   │   │   ├── gt.png           # Ground Truth
+│   │   │   ├── dirty_01.png     # 干扰图像
+│   │   │   └── ...
+│   │   └── chip002/
+│   │       └── ...
+│   └── processed/               # 预处理后的NPZ文件
+│       ├── training_v1.npz
+│       └── test_v1.npz
+│
+└── experiments/                 # 训练输出
     ├── 2024-01-30_baseline/
     └── 2024-01-31_augmented/
 ```
@@ -75,19 +79,179 @@ python scripts/rename_dataset.py dataset/chip001 --gt-image IMG_9999.jpg
 
 ---
 
-## 🔧 第二步：运行数据准备脚本
+## � 第二步：Stage1 YOLO 数据集准备与训练
+
+### YOLO 数据集标注格式
+
+YOLO 使用 **YOLO 格式标注**（`.txt` 文件），每行一个检测框：
+
+```
+<class_id> <center_x> <center_y> <width> <height>
+```
+
+**坐标归一化**：所有值都在 [0, 1] 范围内，相对于图像尺寸。
+
+**示例** (`chip001.txt`)：
+```
+0 0.342 0.512 0.085 0.092   # 类别0: chamber_dark
+1 0.658 0.488 0.081 0.089   # 类别1: chamber_lit
+...
+```
+
+### 数据集组织
+
+```
+data/stage1_detection/yolo_v1/
+├── images/
+│   ├── train/                 # 训练图像
+│   │   ├── chip001.png
+│   │   ├── chip002.png
+│   │   └── ...
+│   └── val/                   # 验证图像（可选，可用 train 代替）
+│       └── ...
+├── labels/
+│   ├── train/                 # 训练标注
+│   │   ├── chip001.txt        # 与图像同名
+│   │   ├── chip002.txt
+│   │   └── ...
+│   └── val/
+│       └── ...
+└── data.yaml                  # 数据集配置文件
+```
+
+### 配置文件 `data.yaml`
+
+```yaml
+train: images/train
+val: images/train   # 如果没有单独验证集，可以用训练集
+
+nc: 2  # 类别数量
+names: 
+  0: chamber_dark   # 类别0: 暗腔室
+  1: chamber_lit    # 类别1: 亮腔室
+```
+
+> **💡 提示**：如果你没有时间标注验证集，直接让 `val: images/train`。训练时会在训练集上做验证，虽然不够严格，但可以看到拟合效果。
+
+### YOLO 训练命令
+
+#### 方法 1：使用 Ultralytics CLI（推荐）
+
+```bash
+# 新建训练（从预训练模型开始）
+yolo detect train \
+    data=data/stage1_detection/yolo_v1/data.yaml \
+    model=yolov8n.pt \
+    epochs=100 \
+    imgsz=640 \
+    batch=16 \
+    device=0 \
+    project=runs/yolo_train \
+    name=chambers_v1
+```
+
+#### 方法 2：Python 脚本
+
+创建 `scripts/train_yolo.py`：
+
+```python
+from ultralytics import YOLO
+
+# 加载预训练模型
+model = YOLO('yolov8n.pt')  # nano 版本，快速
+
+# 训练
+results = model.train(
+    data='data/stage1_detection/yolo_v1/data.yaml',
+    epochs=100,
+    imgsz=640,
+    batch=16,
+    device=0,
+    project='runs/yolo_train',
+    name='chambers_v1',
+    
+    # 数据增强（推荐）
+    hsv_h=0.015,      # 色调抖动
+    hsv_s=0.7,        # 饱和度
+    hsv_v=0.4,        # 亮度
+    degrees=10,       # 旋转
+    mosaic=1.0,       # Mosaic 增强
+    mixup=0.1,        # MixUp 增强
+)
+
+print(f"训练完成，mAP@0.5: {results.box.map50}")
+```
+
+运行：
+```bash
+python scripts/train_yolo.py
+```
+
+### 训练输出
+
+```
+runs/yolo_train/chambers_v1/
+├── weights/
+│   ├── best.pt                 # 最佳模型（按 mAP）
+│   └── last.pt                 # 最终模型
+├── results.png                 # 训练曲线
+├── confusion_matrix.png        # 混淆矩阵
+├── val_batch0_labels.jpg       # 验证集真值
+├── val_batch0_pred.jpg         # 验证集预测（肉眼看效果）
+└── args.yaml                   # 训练参数记录
+```
+
+> **👀 肉眼可视化**：查看 `val_batch0_pred.jpg` 查看模型在验证集上的预测效果！
+
+### YOLO 模型验证
+
+```bash
+# 在验证集上评估
+yolo detect val \
+    model=runs/yolo_train/chambers_v1/weights/best.pt \
+    data=data/stage1_detection/yolo_v1/data.yaml
+
+# 单张图像推理
+yolo detect predict \
+    model=runs/yolo_train/chambers_v1/weights/best.pt \
+    source=test_image.png \
+    conf=0.5
+```
+
+### 将训练好的模型部署到项目
+
+训练完成后，将最佳模型复制到项目权重目录：
+
+```bash
+# Windows
+copy runs\yolo_train\chambers_v1\weights\best.pt weights\yolo\best.pt
+
+# Linux/Mac
+cp runs/yolo_train/chambers_v1/weights/best.pt weights/yolo/best.pt
+```
+
+然后更新 `configs/default.yaml`：
+```yaml
+stage1:
+  yolo:
+    weights_path: "weights/yolo/best.pt"
+```
+
+---
+
+## 🔧 第三步：Stage2 UNet 数据准备
 
 ### 基础用法
 
 ```bash
-python scripts/prepare_training_data.py data/raw/microfluidics_v1/training -o data/processed/microfluidics_v1/training.npz
+python scripts/prepare_training_data.py data/stage2_correction/raw -o data/stage2_correction/processed/training_v1.npz
 ```
 
 ### 使用离线增强 (v1.2)
 
 ```bash
 # 5倍ISP增强 (推荐)
-python scripts/prepare_training_data.py data/raw/microfluidics_v1/training -o data/processed/microfluidics_v1/training.npz \
+python scripts/prepare_training_data.py data/stage2_correction/raw -o data/stage2_correction/processed/training_v1.npz \
     --augment --aug-multiplier 5
 ```
 
@@ -102,8 +266,8 @@ python scripts/prepare_training_data.py data/raw/microfluidics_v1/training -o da
 
 ```bash
 python scripts/prepare_training_data.py \
-    data/raw/microfluidics_v1/training \
-    --output data/processed/microfluidics_v1/training.npz \
+    data/stage2_correction/raw \
+    --output data/stage2_correction/processed/training_v1.npz \
     --config configs/default.yaml \
     --augment \
     --aug-multiplier 5 \
@@ -123,7 +287,7 @@ python scripts/prepare_training_data.py \
 
 | 文件 | 说明 |
 |------|------|
-| `data/processed/microfluidics_v1/training.npz` | 训练数据（target_in, ref_in, labels） |
+| `data/stage2_correction/processed/training_v1.npz` | 训练数据（target_in, ref_in, labels） |
 | `chip*/debug_gt.png` | GT图像的检测+几何校正可视化（调试用） |
 | `chip*/debug_dirty_*.png` | Dirty图像的可视化（调试用） |
 
@@ -142,7 +306,7 @@ python scripts/verify_npz_format.py processed_data/training.npz
 
 ---
 
-## 🎯 第三步：训练模型
+## 🎯 第四步：训练 Stage2 UNet 模型
 
 ### 日常训练（推荐）
 
@@ -189,7 +353,7 @@ runs/my_training/
 
 ---
 
-## 📊 第四步：评估模型
+## 📊 第五步：评估 Stage2 模型
 
 ### 准备测试集
 
@@ -225,7 +389,7 @@ python scripts/evaluate_experiments.py \
 
 ---
 
-## 🚀 第五步：使用训练好的模型
+## 🚀 第六步：使用训练好的模型
 
 ### CLI 推理
 
