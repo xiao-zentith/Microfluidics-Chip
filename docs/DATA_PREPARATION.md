@@ -21,16 +21,17 @@ data/
 │       └── data.yaml
 │
 ├── stage2_correction/           # Stage2: UNet 光照校正数据（独立管理）
-│   ├── raw/                     # 原始拍摄数据
-│   │   ├── chip001/             # 第1个芯片
-│   │   │   ├── gt.png           # Ground Truth
-│   │   │   ├── dirty_01.png     # 干扰图像
+│   ├── microfluidics_v1/        # ✅ 数据集名称（推荐以实验版本命名）
+│   │   ├── raw/                 # 原始拍摄数据
+│   │   │   ├── chip001/
+│   │   │   │   ├── gt.png
+│   │   │   │   └── ...
 │   │   │   └── ...
-│   │   └── chip002/
-│   │       └── ...
-│   └── processed/               # 预处理后的NPZ文件
-│       ├── training_v1.npz
-│       └── test_v1.npz
+│   │   └── processed/           # 预处理后的NPZ文件
+│   │       ├── training.npz
+│   │       └── test.npz
+│   └── microfluidics_v2/        # 示例：未来可添加更多数据集
+│       └── ...
 │
 └── experiments/                 # 训练输出
     ├── 2024-01-30_baseline/
@@ -133,6 +134,24 @@ names:
 
 > **💡 提示**：如果你没有时间标注验证集，直接让 `val: images/train`。训练时会在训练集上做验证，虽然不够严格，但可以看到拟合效果。
 
+### 🚀 (强烈推荐) 使用离线增强扩充数据集
+
+为了解决光照和距离带来的域偏移（Domain Shift），建议先运行该脚本对数据集进行 5 倍扩充。这能利用 Stage2 的物理光照模型 (ISP) 让 YOLO 见过各种极端光照。
+
+**功能**: 生成不同光照、白平衡、噪声的 "Dirty" 图像，保留原始标签。
+
+```bash
+python scripts/augment_yolo_dataset.py \
+    --input data/stage1_detection/yolo_v1/images/train \
+    --multiplier 5
+```
+
+**效果**:
+- 训练集数量：**N -> 5N** (例：300 -> 1500 张)
+- 覆盖率：大幅提升对阴影、过曝、低光照的检测能力。
+
+---
+
 ### YOLO 训练命令
 
 #### 方法 1：使用 Ultralytics CLI（推荐）
@@ -147,7 +166,18 @@ yolo detect train \
     batch=16 \
     device=0 \
     project=runs/yolo_train \
-    name=chambers_v1
+    name=chambers_v1 \
+    # --- 数据增强参数 (默认已开启，此处显式设置示范) ---
+    hsv_h=0.015    # 色调 (Hue) 增强
+    hsv_s=0.7      # 饱和度 (Saturation) 增强
+    hsv_v=0.4      # 亮度 (Value) 增强
+    degrees=10.0   # 旋转 (+/- 10度)
+    translate=0.1  # 平移 (+/- 0.1)
+    scale=0.5      # 缩放 (+/- 0.5)
+    flipud=0.0     # 垂直翻转概率 (显微镜图像推荐设为 0.5)
+    fliplr=0.5     # 水平翻转概率
+    mosaic=1.0     # Mosaic 增强 (拼接4张图，极强，推荐开启)
+    mixup=0.0      # MixUp 增强 (混合2张图，推荐关闭或设低)
 ```
 
 #### 方法 2：Python 脚本
@@ -244,14 +274,14 @@ stage1:
 ### 基础用法
 
 ```bash
-python scripts/prepare_training_data.py data/stage2_correction/raw -o data/stage2_correction/processed/training_v1.npz
+python scripts/prepare_training_data.py data/stage2_correction/microfluidics_v1/raw -o data/stage2_correction/microfluidics_v1/processed/training.npz
 ```
 
 ### 使用离线增强 (v1.2)
 
 ```bash
 # 5倍ISP增强 (推荐)
-python scripts/prepare_training_data.py data/stage2_correction/raw -o data/stage2_correction/processed/training_v1.npz \
+python scripts/prepare_training_data.py data/stage2_correction/microfluidics_v1/raw -o data/stage2_correction/microfluidics_v1/processed/training.npz \
     --augment --aug-multiplier 5
 ```
 
@@ -266,8 +296,8 @@ python scripts/prepare_training_data.py data/stage2_correction/raw -o data/stage
 
 ```bash
 python scripts/prepare_training_data.py \
-    data/stage2_correction/raw \
-    --output data/stage2_correction/processed/training_v1.npz \
+    data/stage2_correction/microfluidics_v1/raw \
+    --output data/stage2_correction/microfluidics_v1/processed/training.npz \
     --config configs/default.yaml \
     --augment \
     --aug-multiplier 5 \
@@ -287,7 +317,7 @@ python scripts/prepare_training_data.py \
 
 | 文件 | 说明 |
 |------|------|
-| `data/stage2_correction/processed/training_v1.npz` | 训练数据（target_in, ref_in, labels） |
+| `data/stage2_correction/microfluidics_v1/processed/training.npz` | 训练数据（target_in, ref_in, labels） |
 | `chip*/debug_gt.png` | GT图像的检测+几何校正可视化（调试用） |
 | `chip*/debug_dirty_*.png` | Dirty图像的可视化（调试用） |
 
@@ -316,7 +346,7 @@ python scripts/train_stage2.py processed_data/training.npz -o runs/my_training -
 
 **参数说明：**
 ```bash
-python scripts/train_stage2.py processed_data/training.npz \
+python scripts/train_stage2.py data/stage2_correction/microfluidics_v1/processed/training.npz \
     --output runs/my_training \
     --epochs 100 \
     --batch-size 32 \

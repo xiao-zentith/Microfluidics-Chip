@@ -7,16 +7,16 @@ experiment_name: "microfluidics_default"
 paths:
   data_dir: "data"
   stage1_data: "data/stage1_detection"    # Stage1 YOLO训练数据
-  stage2_data: "data/stage2_correction"   # Stage2 UNet训练数据
+  stage2_data: "data/stage2_correction/microfluidics_v2" # Stage2 UNet数据 (v1)
   runs_dir: "runs"
   weights_dir: "weights"
 
 # Stage1: 目标检测与几何校正
 stage1:
   yolo:
-    weights_path: "weights/yolo/best.pt"  # YOLO detection weights path
+    weights_path: "weights/yolo/best2.pt"  # YOLO detection weights path
     device: "cuda"
-    confidence_threshold: 0.5
+    confidence_threshold: 0.2
     class_id_blank: 0
     class_id_lit: 1
   

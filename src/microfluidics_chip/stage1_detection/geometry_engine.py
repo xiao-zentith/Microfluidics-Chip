@@ -235,7 +235,10 @@ class CrossGeometryEngine:
                 ]
                 
                 # 尺寸校正
-                if patch.shape[0] != self.config.slice_size[0] or patch.shape[1] != self.config.slice_size[1]:
+                if patch.size == 0:
+                    logger.warning(f"Empty patch for chamber {i} (tx={tx:.1f}, ty={ty:.1f}). Filling black.")
+                    patch = np.zeros((self.config.slice_size[1], self.config.slice_size[0], 3), dtype=np.uint8)
+                elif patch.shape[0] != self.config.slice_size[0] or patch.shape[1] != self.config.slice_size[1]:
                     patch = cv2.resize(patch, self.config.slice_size)
                 
                 patches.append(patch)

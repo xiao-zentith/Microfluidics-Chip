@@ -38,17 +38,17 @@
 
 ```bash
 # 不使用增强
-python scripts/prepare_training_data.py data/stage2_correction/raw -o data/stage2_correction/processed/training_v1.npz
+python scripts/prepare_training_data.py data/stage2_correction/microfluidics_v1/raw -o data/stage2_correction/microfluidics_v1/processed/training.npz
 
 # 使用5倍ISP增强
-python scripts/prepare_training_data.py data/stage2_correction/raw -o data/stage2_correction/processed/training_v1.npz \
+python scripts/prepare_training_data.py data/stage2_correction/microfluidics_v1/raw -o data/stage2_correction/microfluidics_v1/processed/training.npz \
     --augment --aug-multiplier 5
 ```
 
 ### 2. 训练（在线几何增强）
 
 ```bash
-python scripts/train_stage2.py data/stage2_correction/processed/training_v1.npz -o data/experiments/baseline \
+python scripts/train_stage2.py data/stage2_correction/microfluidics_v1/processed/training.npz -o data/experiments/baseline \
     --augment  # 启用在线几何增强
 ```
 
