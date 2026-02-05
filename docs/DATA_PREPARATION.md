@@ -154,7 +154,12 @@ python scripts/augment_yolo_dataset.py \
 
 ### YOLO 训练命令
 
-#### 方法 1：使用 Ultralytics CLI（推荐）
+> [!IMPORTANT]
+> **关于训练输出路径**: Ultralytics YOLO 有全局配置文件 `~/.config/Ultralytics/settings.json`，其中 `runs_dir` 可能覆盖 `project` 参数。
+> - 首次使用前请运行 `yolo settings reset` 重置配置（只需一次）
+> - 或使用下方的 **Python 脚本**（自动处理路径问题）
+
+#### 方法 1：使用 Ultralytics CLI
 
 ```bash
 # 新建训练（从预训练模型开始）
@@ -165,7 +170,7 @@ yolo detect train \
     imgsz=640 \
     batch=16 \
     device=0 \
-    project=runs/yolo_train \
+    project=data/experiments/yolo \
     name=chambers_v1 \
     # --- 数据增强参数 (默认已开启，此处显式设置示范) ---
     hsv_h=0.015    # 色调 (Hue) 增强
@@ -180,9 +185,22 @@ yolo detect train \
     mixup=0.0      # MixUp 增强 (混合2张图，推荐关闭或设低)
 ```
 
-#### 方法 2：Python 脚本
+#### 方法 2：Python 脚本（推荐）
 
-创建 `scripts/train_yolo.py`：
+使用 `scripts/train_yolo.py`（自动处理路径问题）：
+
+```bash
+# 查看帮助
+python scripts/train_yolo.py --help
+
+# 训练（使用默认配置）
+python scripts/train_yolo.py --data yolo_v3 --name chambers_v1
+
+# 训练（自定义参数）
+python scripts/train_yolo.py --data yolo_v3 --name chambers_v2 --epochs 100 --imgsz 1280 --batch 16
+```
+
+脚本内部实现：
 
 ```python
 from ultralytics import YOLO
@@ -197,7 +215,7 @@ results = model.train(
     imgsz=640,
     batch=16,
     device=0,
-    project='runs/yolo_train',
+    project='data/experiments/yolo',  # 使用统一输出目录
     name='chambers_v1',
     
     # 数据增强（推荐）
@@ -220,7 +238,7 @@ python scripts/train_yolo.py
 ### 训练输出
 
 ```
-runs/yolo_train/chambers_v1/
+data/experiments/yolo/chambers_v1/
 ├── weights/
 │   ├── best.pt                 # 最佳模型（按 mAP）
 │   └── last.pt                 # 最终模型
@@ -238,12 +256,12 @@ runs/yolo_train/chambers_v1/
 ```bash
 # 在验证集上评估
 yolo detect val \
-    model=runs/yolo_train/chambers_v1/weights/best.pt \
+    model=data/experiments/yolo/chambers_v1/weights/best.pt \
     data=data/stage1_detection/yolo_v1/data.yaml
 
 # 单张图像推理
 yolo detect predict \
-    model=runs/yolo_train/chambers_v1/weights/best.pt \
+    model=data/experiments/yolo/chambers_v1/weights/best.pt \
     source=test_image.png \
     conf=0.5
 ```
@@ -254,10 +272,10 @@ yolo detect predict \
 
 ```bash
 # Windows
-copy runs\yolo_train\chambers_v1\weights\best.pt weights\yolo\best.pt
+copy data\experiments\yolo\chambers_v1\weights\best.pt weights\yolo\best.pt
 
 # Linux/Mac
-cp runs/yolo_train/chambers_v1/weights/best.pt weights/yolo/best.pt
+cp data/experiments/yolo/chambers_v1/weights/best.pt weights/yolo/best.pt
 ```
 
 然后更新 `configs/default.yaml`：
