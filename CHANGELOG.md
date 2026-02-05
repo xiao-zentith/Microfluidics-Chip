@@ -1,10 +1,64 @@
-# Microfluidics-Chip v1.1 - Changelog
+# Microfluidics-Chip v1.2 - Changelog
 
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+
+## [1.2.0] - 2026-02-05
+
+### 🎯 Adaptive Detection Pipeline
+
+全新自适应检测管线，解决暗腔室漏检、远近尺度变化和复杂光照环境下的检测问题。
+
+### ✨ Added
+
+#### 数据与标签策略
+- **标签迁移脚本** (`scripts/migrate_labels_to_single_class.py`): 多类别→单类别迁移
+  - 支持 dry-run 预览、自动备份、更新 data.yaml
+  
+- **分层增强脚本** (`scripts/augment_yolo_dataset.py` 改造):
+  - 分层采样: 70% mild / 25% medium / 5% extreme
+  - CLAHE/Invert 开关 (`--enable-clahe`, `--no-invert`)
+
+#### Stage1 自适应检测
+- **预处理模块** (`stage1_detection/preprocess.py`):
+  - `apply_clahe()`: LAB L通道对比度增强
+  - `apply_invert()`: 亮度反转
+  - `preprocess_image()`: 统一预处理流水线
+
+- **自适应检测器** (`stage1_detection/adaptive_detector.py`):
+  - 粗到精检测: global_scan → cluster_roi → fine_scan
+  - DBSCAN 聚类自动 ROI
+  - 坐标映射回原图
+
+- **拓扑拟合器** (`stage1_detection/topology_fitter.py`):
+  - 十字模板定义 (4臂×3腔室，无中心)
+  - RANSAC Similarity Transform 拟合
+  - 缺失腔室回填
+  - 暗腔室亮度判定 (位于臂最外侧)
+
+- **集成入口** (`stage1_detection/inference.py`):
+  - 新增 `infer_stage1_adaptive()` 函数
+
+#### 配置与类型
+- **新增配置类** (`core/config.py`):
+  - `AdaptiveDetectionConfig`: 粗细扫描、聚类参数
+  - `TopologyConfig`: 模板、RANSAC、亮度判定参数
+
+- **新增类型** (`core/types.py`):
+  - `AdaptiveDetectionResult`: 完整检测结果
+
+#### 示例与配置模板
+- **端到端示例** (`examples/adaptive_detection_demo.py`)
+- **配置模板** (`configs/adaptive_detection.yaml`)
+
+#### 测试
+- **单元测试** (`tests/unit/test_adaptive_detection.py`): 14 tests passed
+
+---
+
 
 ## [1.1.0] - 2026-01-28
 

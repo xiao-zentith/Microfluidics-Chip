@@ -22,6 +22,30 @@ python examples/end_to_end.py 3
 python examples/end_to_end.py 4
 ```
 
+### 2. `adaptive_detection_demo.py` - 自适应检测示例 (v2.0 新增)
+
+演示粗到精自适应检测 + 拓扑拟合 + 暗腔室判定的完整流程。
+
+```bash
+# 基本用法
+python examples/adaptive_detection_demo.py --image path/to/image.jpg
+
+# 指定权重和输出目录
+python examples/adaptive_detection_demo.py \
+    --image path/to/image.jpg \
+    --weights weights/yolo/best.pt \
+    --output output/demo/
+
+# 使用配置文件
+python examples/adaptive_detection_demo.py \
+    --image path/to/image.jpg \
+    --config configs/adaptive_detection.yaml
+```
+
+**输出**：
+- `{chip_id}_visualization.png` - 检测结果可视化
+- `{chip_id}_detections.json` - 12 个腔室坐标 + 暗腔室标记
+
 ## Creating Your Own Scripts
 
 ### Basic Template

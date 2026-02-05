@@ -41,6 +41,51 @@ class Stage1Config(BaseModel):
     geometry: GeometryConfig
 
 
+# ==================== 自适应检测配置 ====================
+
+class AdaptiveDetectionConfig(BaseModel):
+    """自适应粗到精检测配置"""
+    # 粗扫描参数
+    coarse_imgsz: int = Field(default=640, description="粗扫描分辨率")
+    coarse_conf: float = Field(default=0.08, ge=0.0, le=1.0, description="粗扫描置信度阈值")
+    
+    # 精细扫描参数
+    fine_imgsz: int = Field(default=1280, description="精细扫描分辨率")
+    fine_conf: float = Field(default=0.3, ge=0.0, le=1.0, description="精细扫描置信度阈值")
+    
+    # 聚类参数
+    cluster_eps: float = Field(default=100.0, description="DBSCAN eps 参数（像素）")
+    cluster_min_samples: int = Field(default=3, description="DBSCAN min_samples")
+    roi_margin: float = Field(default=1.3, ge=1.0, description="ROI 扩展系数")
+    min_roi_size: int = Field(default=200, description="最小 ROI 尺寸")
+    
+    # 预处理参数
+    enable_clahe: bool = Field(default=True, description="是否启用 CLAHE")
+    clahe_clip_limit: float = Field(default=2.0, description="CLAHE clip limit")
+
+
+class TopologyConfig(BaseModel):
+    """拓扑拟合配置"""
+    # 模板参数
+    template_scale: float = Field(default=50.0, description="模板点间距（像素）")
+    template_path: Optional[str] = Field(default=None, description="自定义模板文件路径 (JSON)")
+    
+    # RANSAC 参数
+    ransac_iters: int = Field(default=200, description="RANSAC 迭代次数")
+    ransac_threshold: float = Field(default=25.0, description="RANSAC 内点阈值（像素）")
+    min_inliers: int = Field(default=4, description="最少内点数")
+    
+    # 可见性判定
+    visibility_margin: int = Field(default=10, description="边界安全距离（像素）")
+    
+    # 暗腔室判定
+    brightness_roi_size: int = Field(default=30, description="亮度判定 ROI 尺寸")
+    dark_percentile: float = Field(default=25.0, ge=0.0, le=100.0, description="暗腔室判定分位数阈值")
+    
+    # 回退参数
+    fallback_to_affine: bool = Field(default=True, description="Similarity 失败时是否回退到 Affine")
+
+
 # ==================== Stage2 配置 ====================
 
 class UNetModelConfig(BaseModel):

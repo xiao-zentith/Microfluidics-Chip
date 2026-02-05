@@ -81,6 +81,39 @@ class Stage1Output(BaseModel):
     has_gt_slices: bool = False
 
 
+# ==================== 自适应检测结果 ====================
+
+class AdaptiveDetectionResult(BaseModel):
+    """
+    自适应检测完整结果
+    
+    包含粗到精检测结果、聚类信息、拓扑拟合结果和暗腔室判定
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    # 检测结果
+    detections: List[ChamberDetection]  # 最终检测列表
+    
+    # 聚类信息
+    roi_bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
+    cluster_score: float  # 聚类质量评分
+    is_fallback: bool = False  # 是否使用回退策略
+    
+    # 拓扑拟合结果
+    fitted_centers: Any  # np.ndarray (12, 2)
+    visibility: Any  # np.ndarray (12,) bool
+    detected_mask: Any  # np.ndarray (12,) bool
+    dark_chamber_indices: List[int]  # 暗腔室索引列表
+    
+    # 质量指标
+    inlier_ratio: float = 0.0  # RANSAC 内点比例
+    reprojection_error: float = 0.0  # 平均重投影误差
+    fit_success: bool = False  # 拓扑拟合是否成功
+    
+    # 元数据
+    processing_time: float = 0.0
+
+
 # ==================== Stage2 契约 ====================
 
 class Stage2Result(BaseModel):
