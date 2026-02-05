@@ -44,6 +44,7 @@ from pathlib import Path
 from tqdm import tqdm
 from dataclasses import dataclass
 from typing import Tuple, Optional
+from datetime import datetime
 
 # 添加 src 到路径以便导入模块
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -183,21 +184,12 @@ def augment_yolo_dataset(
     # 预处理开关
     enable_clahe: bool = True,
     enable_invert: bool = False,
-    clahe_clip_limit: float = 2.0
+    clahe_clip_limit: float = 2.0,
+    # 新增：原地修改开关
+    in_place: bool = False
 ):
     """
-    增强 YOLO 数据集 (v2.0 分层采样版)
-    
-    :param input_dir: 输入图片目录 (images/train)
-    :param output_root: 新数据集的根目录。如果为 None，则原地增强
-    :param multiplier: 每张原图生成的增强副本数量
-    :param p_augment: 每张图进行增强的概率
-    :param mild_ratio: mild 档位比例 (默认 70%)
-    :param medium_ratio: medium 档位比例 (默认 25%)
-    :param extreme_ratio: extreme 档位比例 (默认 5%)
-    :param enable_clahe: 是否启用 CLAHE 预处理
-    :param enable_invert: 是否启用 Invert 预处理
-    :param clahe_clip_limit: CLAHE clip limit
+    增强 YOLO 数据集 (v2.1 分离存储版)
     """
     # 验证比例总和
     total_ratio = mild_ratio + medium_ratio + extreme_ratio
@@ -209,7 +201,7 @@ def augment_yolo_dataset(
     
     # 寻找标签目录
     dataset_root = input_dir.parent.parent
-    image_dirname = input_dir.name
+    image_dirname = input_dir.name  # e.g., 'train' or 'val'
     label_dir = dataset_root / "labels" / image_dirname
     
     if not label_dir.exists():
@@ -218,25 +210,31 @@ def augment_yolo_dataset(
         return
 
     # 确定输出目录
-    if output_root:
-        output_image_dir = output_root / "images" / image_dirname
-        output_label_dir = output_root / "labels" / image_dirname
-        logger.info(f"Creating new dataset at: {output_root}")
-    else:
+    if in_place:
+        if output_root is not None:
+            logger.warning("Argument --output-root is ignored because --in-place is set!")
+        output_root = dataset_root
         output_image_dir = input_dir
         output_label_dir = label_dir
-        logger.info(f"Augmenting in-place at: {input_dir}")
+        logger.warning(f"⚠️  AUGMENTING IN-PLACE at: {input_dir}")
+    else:
+        # 如果未指定输出目录，自动生成默认目录
+        if output_root is None:
+            output_root = dataset_root.parent / f"{dataset_root.name}_augmented"
+        
+        output_image_dir = output_root / "images" / image_dirname
+        output_label_dir = output_root / "labels" / image_dirname
+        logger.info(f"Creating NEW dataset at: {output_root}")
 
     output_image_dir.mkdir(parents=True, exist_ok=True)
     output_label_dir.mkdir(parents=True, exist_ok=True)
 
     # 日志配置信息
     logger.info("=" * 50)
-    logger.info("Augmentation Configuration (v2.0)")
+    logger.info("Augmentation Configuration (v2.1)")
     logger.info("=" * 50)
     logger.info(f"Input Images:   {input_dir}")
-    logger.info(f"Input Labels:   {label_dir}")
-    logger.info(f"Output Images:  {output_image_dir}")
+    logger.info(f"Output Root:    {output_root}")
     logger.info(f"Multiplier:     {multiplier}x")
     logger.info(f"Tier Ratios:    mild={mild_ratio:.0%}, medium={medium_ratio:.0%}, extreme={extreme_ratio:.0%}")
     logger.info(f"Preprocessing:  CLAHE={enable_clahe}, Invert={enable_invert}")
@@ -263,7 +261,7 @@ def augment_yolo_dataset(
             continue
             
         # 2. 如果是新数据集模式，先复制原始文件
-        if output_root:
+        if not in_place:
             out_img_path = output_image_dir / img_path.name
             out_txt_path = output_label_dir / txt_name
             
@@ -317,7 +315,7 @@ def augment_yolo_dataset(
     logger.info("=" * 50)
     logger.info("Augmentation Complete!")
     logger.info("=" * 50)
-    if output_root:
+    if not in_place:
         logger.info(f"Copied {count_copied} original samples")
         
         # 复制 data.yaml
@@ -327,14 +325,24 @@ def augment_yolo_dataset(
             if not yaml_dst.exists():
                 shutil.copy2(yaml_src, yaml_dst)
                 logger.info(f"Copied data.yaml to {yaml_dst}")
+            
+            # 尝试追加增强说明信息 (可选)
+            try:
+                with open(yaml_dst, 'a') as f:
+                    f.write(f"\n# Augmented at {datetime.now().isoformat()}\n")
+                    f.write(f"# Source: {dataset_root.name}\n")
+                    f.write(f"# Config: multiplier={multiplier}, clahe={enable_clahe}\n")
+            except Exception:
+                pass
     
     logger.info(f"Generated {count_generated} new augmented samples")
     logger.info(f"Tier distribution: {tier_counts}")
+    logger.info(f"New dataset location: {output_root}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Augment YOLO dataset with Physics-based ISP degradation (v2.0 Tiered Sampling)",
+        description="Augment YOLO dataset with Physics-based ISP degradation (v2.1 Separate Output)",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -342,7 +350,10 @@ def main():
     parser.add_argument("--input", type=Path, required=True, 
                         help="Path to images directory (e.g. data/stage1_detection/yolo_v3/images/train)")
     parser.add_argument("--output-root", type=Path, default=None, 
-                        help="Root directory for the NEW dataset. If not set, augments in-place.")
+                        help="Root directory for the NEW dataset. Defaults to '{input_parent}_augmented'.")
+    parser.add_argument("--in-place", action="store_true",
+                        help="WARNING: Augment in-place (modify original dataset). Overrides --output-root.")
+    
     parser.add_argument("--multiplier", type=int, default=5, 
                         help="Number of augmented copies per image (default: 5)")
     parser.add_argument("--prob", type=float, default=1.0, 
@@ -390,7 +401,8 @@ def main():
         extreme_ratio=args.extreme_ratio,
         enable_clahe=args.enable_clahe,
         enable_invert=args.enable_invert,
-        clahe_clip_limit=args.clahe_clip_limit
+        clahe_clip_limit=args.clahe_clip_limit,
+        in_place=args.in_place
     )
     return 0
 
