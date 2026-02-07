@@ -481,33 +481,74 @@ class TopologyFitter:
         if not brightnesses:
             return [], brightnesses
         
-        # 在最外侧腔室中找亮度最低的
-        outermost_brightness = {
-            i: brightnesses[i]
-            for i in OUTERMOST_CHAMBER_INDICES
-            if i in brightnesses
-        }
-        
+        # 获取所有 4 个最外侧位置的亮度
+        outermost_brightness = {}
+        for idx in OUTERMOST_CHAMBER_INDICES:
+            if idx in brightnesses:
+                outermost_brightness[idx] = brightnesses[idx]
+            else:
+                # 理论上 fit_and_fill 后 fitted_centers 都有坐标，
+                # 但如果 visibility=False 或图像 ROI 越界可能导致缺失。
+                # 这种情况下我们无法评估该位置。
+                pass
+
         if not outermost_brightness:
             logger.warning("No visible outermost chambers for dark detection")
             return [], brightnesses
         
-        # 找到亮度最低的最外侧腔室
-        dark_idx = min(outermost_brightness, key=outermost_brightness.get)
+        # 1. 强制竞择：找出最暗的那个
+        dark_candidate_idx = min(outermost_brightness, key=outermost_brightness.get)
+        dark_val = outermost_brightness[dark_candidate_idx]
         
-        # 如果该腔室亮度确实显著低于其他腔室，才标记为暗腔室
-        brightness_values = list(brightnesses.values())
-        threshold = np.percentile(brightness_values, self.config.dark_percentile)
+        # 2. 相对验证：计算对比度
+        # 对比度 = 暗腔室亮度 / 其他最外侧腔室的平均亮度
+        other_vals = [
+            v for k, v in outermost_brightness.items() 
+            if k != dark_candidate_idx
+        ]
         
-        if brightnesses[dark_idx] < threshold:
-            dark_indices = [dark_idx]
+        if not other_vals:
+            # 只有一个最外侧腔室可见，无法对比，只能盲信
+            logger.warning(f"Only one outermost chamber visible ({dark_candidate_idx}), selecting as dark chamber without contrast check.")
+            return [dark_candidate_idx], brightnesses
+            
+        avg_other = sum(other_vals) / len(other_vals)
+        contrast_ratio = dark_val / (avg_other + 1e-6)
+        
+        # 3. 双重保险判定逻辑 (v1.4 Safety First)
+        # 目标：宁可漏判 (返回空)，不可误判 (防止 Stage 2 基准错误)
+        
+        # 阈值定义
+        RATIO_STRONG = 0.80     # 差异显著 (无需看绝对亮度)
+        RATIO_WEAK = 0.90       # 差异中等 (需要绝对亮度辅助)
+        ABS_DARK_LIMIT = 80.0   # 绝对黑度阈值 (0-255)
+        
+        is_confirmed = False
+        reason = ""
+        
+        if contrast_ratio < RATIO_STRONG:
+            is_confirmed = True
+            reason = "Strong Contrast"
+        elif contrast_ratio < RATIO_WEAK and dark_val < ABS_DARK_LIMIT:
+            is_confirmed = True
+            reason = "Moderate Contrast + Low Absolute Brightness"
         else:
-            dark_indices = []  # 无暗腔室（所有腔室亮度相近）
-        
-        logger.info(f"Dark chamber detection: outermost candidates={list(outermost_brightness.keys())}, "
-                   f"selected={dark_indices}, brightness={brightnesses.get(dark_idx, 'N/A'):.1f}")
-        
-        return dark_indices, brightnesses
+            is_confirmed = False
+            reason = "Insufficient Evidence"
+
+        logger.info(f"Dark detection analysis: "
+                   f"Candidate={dark_candidate_idx} (val={dark_val:.1f}), "
+                   f"Others_Avg={avg_other:.1f}, "
+                   f"Ratio={contrast_ratio:.2f} -> {reason}")
+
+        if is_confirmed:
+            logger.info(f"CONFIRMED dark chamber at {dark_candidate_idx}")
+            return [dark_candidate_idx], brightnesses
+        else:
+            # 只有当证据不足时，我们才返回空，避免误导 Stage 2
+            logger.warning(f"Ambiguous dark chamber signal (Ratio={contrast_ratio:.2f}, Val={dark_val:.1f}). "
+                          f"Returning empty to prevent Stage 2 error.")
+            return [], brightnesses
     
     def _create_failed_result(
         self,
