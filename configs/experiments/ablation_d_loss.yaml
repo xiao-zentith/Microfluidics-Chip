@@ -1,0 +1,65 @@
+# 消融实验 D - 损失函数消融
+# 包含四个配置变体，通过不同的 loss 参数区分
+
+# D1 配置（完整版，Our Method）
+# loss:
+#   roi_radius: 20
+#   edge_weight: 0.1
+#   lambda_cos: 0.2
+
+experiment_name: "ablation_d_full_loss"
+experiment_type: "ablation_d"
+description: "完整损失函数（ROI加权 + Cosine）"
+
+# Stage2 配置
+stage2:
+  model:
+    model_type: "dual_stream"
+    in_channels: 3
+    out_channels: 3
+    features: [64, 128, 256, 512]
+  
+  loss:
+    roi_radius: 20
+    edge_weight: 0.1      # ROI加权启用
+    lambda_cos: 0.2       # Cosine损失启用
+
+# 训练配置
+training:
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 5
+  
+  data_source: "mixed"
+  data_path: "data/training.npz"
+  val_split: 0.2
+
+# 评估配置
+evaluation:
+  test_split: 0.2
+  metrics:
+    - psnr
+    - ssim
+    - rmse
+    - cosine_sim
+    - roi_rmse
+    - edge_rmse
+  roi_radius: 20
+
+# ============================================================
+# 其他变体配置说明（需要分别创建配置文件或通过覆盖参数实现）：
+#
+# D2（ROI加权，无Cosine）:
+#   lambda_cos: 0.0
+#
+# D3（无ROI加权，有Cosine）:
+#   edge_weight: 1.0  # 边缘权重与中心相同
+#   lambda_cos: 0.2
+#
+# D4（纯MSE）:
+#   edge_weight: 1.0
+#   lambda_cos: 0.0
+# ============================================================

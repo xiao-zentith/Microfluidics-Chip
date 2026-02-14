@@ -1,3 +1,0 @@
-chamber_dark
-chamber_lit
-pocket

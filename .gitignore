@@ -27,3 +27,19 @@
 .vscode/
 __pycache__/
 *.pyc
+
+# Weights directory (large files, not committed)
+weights/
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+
+# Training and inference outputs
+outputs/
+
+# Data directories (unified)
+data/
+
+# Torch cache
+.torch/

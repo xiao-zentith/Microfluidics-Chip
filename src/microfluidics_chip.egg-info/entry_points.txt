@@ -1,0 +1,2 @@
+[console_scripts]
+microfluidics-chip = microfluidics_chip.pipelines.cli:app

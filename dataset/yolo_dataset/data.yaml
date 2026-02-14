@@ -1,9 +1,0 @@
-train: /home/asus515/PycharmProjects/YOLO_v11/dataset/yolo_dataset/images/train
-val: /home/asus515/PycharmProjects/YOLO_v11/dataset/yolo_dataset/images/val   # 我们用训练集自己做验证
-
-nc: 2  # 类别数量
-names: 
-  0: chamber_dark     # 类别0: 11个亮的
-  1: chamber_lit    # 类别1: 1个暗的
-
-fl_gamma: 2.0
