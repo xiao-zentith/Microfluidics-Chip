@@ -43,3 +43,9 @@ data/
 
 # Torch cache
 .torch/
+
+# 日志与实验追踪
+logs/
+wandb/
+tensorboard/
+*.log
