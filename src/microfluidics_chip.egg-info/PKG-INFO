@@ -11,6 +11,7 @@ Requires-Dist: torch>=2.0.0
 Requires-Dist: ultralytics>=8.0.0
 Requires-Dist: opencv-python>=4.8.0
 Requires-Dist: numpy>=1.24.0
+Requires-Dist: scikit-learn>=1.2.0
 Requires-Dist: pydantic>=2.0.0
 Requires-Dist: pydantic-settings>=2.0.0
 Requires-Dist: PyYAML>=6.0
@@ -88,7 +89,8 @@ weights/
 # Stage1: 检测与切片
 python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
-  -o data/experiments/stage1
+  -o data/experiments/stage1 \
+  --adaptive
 
 # Stage2: 光照校正
 python -m microfluidics_chip.pipelines.cli stage2 \
@@ -128,14 +130,27 @@ python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
   -o data/experiments/debug \
   --save-slices \
-  --save-debug
+  --save-debug \
+  --adaptive
 
 # 使用自定义配置
 python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
   -o data/experiments/stage1 \
   --config configs/my_config.yaml
+
+# 显式关闭自适应检测（走标准一次检测）
+python -m microfluidics_chip.pipelines.cli stage1 \
+  data/chip001.png \
+  -o data/experiments/stage1 \
+  --no-adaptive
 ```
+
+启用 `--adaptive` 时，`stage1_metadata.json` 会额外包含：
+- `quality_metrics`
+- `quality_gate_passed`
+- `detection_mode`
+- `retry_attempt`
 
 #### Stage2 处理
 
@@ -576,28 +591,3 @@ MIT License - 详见 [LICENSE](LICENSE) 文件
 - [Ultralytics YOLO](https://github.com/ultralytics/ultralytics) - 目标检测框架
 - [PyTorch](https://pytorch.org/) - 深度学习框架
 - [OpenCV](https://opencv.org/) - 图像处理库
-Metadata-Version: 2.4
-Name: microfluidics-chip
-Version: 0.1.0
-Summary: Microfluidic chip image processing pipeline with YOLO detection and UNet correction
-Author: Microfluidics Team
-License: MIT
-Keywords: microfluidics,image-processing,yolo,unet,computer-vision
-Requires-Python: >=3.8
-Description-Content-Type: text/markdown
-Requires-Dist: torch>=2.0.0
-Requires-Dist: ultralytics>=8.0.0
-Requires-Dist: opencv-python>=4.8.0
-Requires-Dist: numpy>=1.24.0
-Requires-Dist: pydantic>=2.0.0
-Requires-Dist: pydantic-settings>=2.0.0
-Requires-Dist: PyYAML>=6.0
-Requires-Dist: typer>=0.9.0
-Requires-Dist: rich>=13.0.0
-Provides-Extra: dev
-Requires-Dist: pytest>=7.0.0; extra == "dev"
-Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
-Requires-Dist: pytest-mock>=3.10.0; extra == "dev"
-Requires-Dist: black>=23.0.0; extra == "dev"
-Requires-Dist: ruff>=0.1.0; extra == "dev"
-Requires-Dist: mypy>=1.0.0; extra == "dev"

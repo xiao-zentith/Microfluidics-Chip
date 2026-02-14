@@ -11,6 +11,9 @@ YOLO 目标检测训练脚本
     # 基本训练
     python scripts/train_yolo.py --data yolo_v3 --name chambers_v1
     
+    # 无验证集训练（val 缺失时推荐）
+    python scripts/train_yolo.py --data yolo_v3 --name chambers_v1 --no-val
+
     # 自定义参数
     python scripts/train_yolo.py --data yolo_v3 --name chambers_v2 --epochs 100 --imgsz 1280 --batch 16
     
@@ -21,15 +24,67 @@ YOLO 目标检测训练脚本
 import argparse
 import sys
 from pathlib import Path
+import yaml
+from typing import Optional, Tuple
 
 # 确保项目根目录在 Python 路径中
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def get_absolute_path(relative_path: str) -> str:
     """将相对路径转换为绝对路径（相对于项目根目录）"""
     return str(PROJECT_ROOT / relative_path)
+
+
+def resolve_dataset_split_path(data_yaml: Path, split_path: str) -> Path:
+    """解析 data.yaml 中的 split 路径为绝对路径。"""
+    p = Path(split_path)
+    if p.is_absolute():
+        return p
+    return data_yaml.parent / p
+
+
+def count_images_in_dir(path: Path) -> int:
+    """统计目录中的图像文件数量（非递归）。"""
+    if not path.exists() or not path.is_dir():
+        return 0
+    return sum(1 for p in path.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
+
+
+def resolve_device(device_arg: str) -> Tuple[str, Optional[int]]:
+    """
+    解析训练设备参数。
+
+    - auto: 自动使用所有可见 GPU；无 GPU 时回退 CPU
+    - 其它输入: 原样返回（如 "0"、"0,1"、"cpu"）
+    """
+    normalized = str(device_arg).strip().lower()
+    if normalized != "auto":
+        if normalized == "cpu":
+            return "cpu", 0
+        if "," in normalized:
+            count = len([x for x in normalized.split(",") if x.strip() != ""])
+            return device_arg, count
+        if normalized.isdigit():
+            return device_arg, 1
+        return device_arg, None
+
+    try:
+        import torch
+    except Exception:
+        return "cpu", 0
+
+    if not torch.cuda.is_available():
+        return "cpu", 0
+
+    gpu_count = torch.cuda.device_count()
+    if gpu_count <= 1:
+        return "0", gpu_count
+
+    all_gpus = ",".join(str(i) for i in range(gpu_count))
+    return all_gpus, gpu_count
 
 
 def main():
@@ -41,6 +96,9 @@ def main():
     # 基本训练
     python scripts/train_yolo.py --data yolo_v3 --name chambers_v1
     
+    # 无验证集训练
+    python scripts/train_yolo.py --data yolo_v3 --name chambers_v1 --no-val
+
     # 自定义参数 (高分辨率)
     python scripts/train_yolo.py --data yolo_v3 --name chambers_v2 \\
         --epochs 100 --imgsz 1280 --batch 16 --model yolo11n.pt
@@ -70,7 +128,7 @@ def main():
     parser.add_argument("--epochs", "-e", type=int, default=100, help="训练轮数, 默认: 100")
     parser.add_argument("--imgsz", type=int, default=640, help="输入图像尺寸, 默认: 640")
     parser.add_argument("--batch", "-b", type=int, default=16, help="批次大小, 默认: 16")
-    parser.add_argument("--device", type=str, default="0", help="设备 (0, 1, cpu), 默认: 0")
+    parser.add_argument("--device", type=str, default="auto", help="设备 (auto, 0, 0,1, cpu), 默认: auto")
     parser.add_argument("--name", "-n", type=str, default="train", help="实验名称, 默认: train")
     
     # 数据增强参数
@@ -92,6 +150,11 @@ def main():
         default=None,
         help="从检查点继续训练 (提供 last.pt 的路径)"
     )
+    parser.add_argument(
+        "--no-val",
+        action="store_true",
+        help="无验证集模式：跳过验证。若 val 缺失/为空也会自动启用。"
+    )
     
     args = parser.parse_args()
     
@@ -108,6 +171,55 @@ def main():
         print(f"错误: 数据集配置不存在: {data_yaml}")
         print(f"可用数据集: {list(Path(get_absolute_path('data/stage1_detection')).iterdir())}")
         sys.exit(1)
+
+    # 训练前检查数据 split，并在必要时自动切换到无验证集模式
+    data_yaml_path = Path(data_yaml)
+    try:
+        with open(data_yaml_path, "r", encoding="utf-8") as f:
+            data_cfg = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"错误: 无法读取数据集配置: {data_yaml_path}")
+        print(f"详情: {e}")
+        sys.exit(1)
+
+    train_cfg = data_cfg.get("train")
+    if not train_cfg:
+        print(f"错误: data.yaml 缺少 train 配置: {data_yaml_path}")
+        sys.exit(1)
+
+    train_path = resolve_dataset_split_path(data_yaml_path, str(train_cfg))
+    if not train_path.exists():
+        print(f"错误: data.yaml 中的 train 路径不存在: {train_path}")
+        sys.exit(1)
+
+    train_count = count_images_in_dir(train_path)
+    if train_count <= 0:
+        print(f"错误: train 目录没有可用图像: {train_path}")
+        sys.exit(1)
+
+    no_val_mode = args.no_val
+    val_cfg = data_cfg.get("val")
+    val_count = 0
+    val_path = None
+    if val_cfg:
+        val_path = resolve_dataset_split_path(data_yaml_path, str(val_cfg))
+        val_count = count_images_in_dir(val_path)
+
+    if not no_val_mode:
+        if not val_cfg or val_path is None or not val_path.exists() or val_count <= 0:
+            no_val_mode = True
+            print("警告: 未检测到可用验证集，自动切换到无验证集训练模式 (--no-val)。")
+            print("      当前训练将跳过每轮验证，建议后续补标后再做正式评估。")
+
+    effective_data_yaml = data_yaml_path
+    if no_val_mode:
+        # Ultralytics 的数据检查需要 val 字段存在；无验证时临时指向 train 并关闭 val 流程
+        data_cfg["val"] = str(train_cfg)
+        effective_data_yaml = data_yaml_path.parent / f"{data_yaml_path.stem}.train_only.yaml"
+        with open(effective_data_yaml, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data_cfg, f, allow_unicode=True, sort_keys=False)
+
+    resolved_device, gpu_count = resolve_device(args.device)
     
     # 构建输出路径 (使用绝对路径，避免全局配置干扰)
     project_dir = get_absolute_path("data/experiments/yolo")
@@ -116,13 +228,20 @@ def main():
     print("YOLO 训练配置")
     print("=" * 60)
     print(f"  项目根目录: {PROJECT_ROOT}")
-    print(f"  数据集配置: {data_yaml}")
+    print(f"  数据集配置: {effective_data_yaml}")
     print(f"  输出目录:   {project_dir}/{args.name}")
     print(f"  模型:       {args.model}")
     print(f"  轮数:       {args.epochs}")
     print(f"  图像尺寸:   {args.imgsz}")
     print(f"  批次大小:   {args.batch}")
-    print(f"  设备:       {args.device}")
+    print(f"  设备:       {resolved_device}")
+    print(f"  训练集样本: {train_count}")
+    if no_val_mode:
+        print("  验证模式:   关闭 (no-val)")
+    else:
+        print(f"  验证集样本: {val_count}")
+    if gpu_count is not None and gpu_count > 1:
+        print(f"  GPU数量:    {gpu_count} (多卡并行)")
     print("=" * 60)
     
     # 继续训练模式
@@ -133,18 +252,19 @@ def main():
             sys.exit(1)
         print(f"从检查点继续训练: {resume_path}")
         model = YOLO(resume_path)
-        results = model.train(resume=True)
+        results = model.train(resume=True, device=resolved_device)
     else:
         # 新建训练
         model = YOLO(args.model)
         results = model.train(
-            data=data_yaml,
+            data=str(effective_data_yaml),
             epochs=args.epochs,
             imgsz=args.imgsz,
             batch=args.batch,
-            device=args.device,
+            device=resolved_device,
             project=project_dir,  # 使用绝对路径
             name=args.name,
+            val=not no_val_mode,
             # 数据增强
             hsv_h=args.hsv_h,
             hsv_s=args.hsv_s,

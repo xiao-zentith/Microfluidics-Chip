@@ -54,6 +54,7 @@ from microfluidics_chip.stage2_correction.augmentations import apply_isp_degrada
 from microfluidics_chip.core.logger import setup_logger, get_logger
 
 logger = get_logger("augment_yolo")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
 # ==================== 分层增强参数配置 ====================
@@ -370,6 +371,69 @@ def apply_tiered_augmentation_v2(
     return result, params
 
 
+def _is_image_file(path: Path) -> bool:
+    """判断是否为支持的图像文件。"""
+    return path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def _ensure_split_labels(src_img_dir: Path, dst_label_dir: Path) -> int:
+    """
+    为 split 下每张图像创建空标签文件（当源 labels/split 不存在时使用）。
+
+    :return: 新建的空标签数量
+    """
+    created = 0
+    dst_label_dir.mkdir(parents=True, exist_ok=True)
+    for img_path in src_img_dir.iterdir():
+        if not _is_image_file(img_path):
+            continue
+        txt_path = dst_label_dir / f"{img_path.stem}.txt"
+        if not txt_path.exists():
+            txt_path.touch()
+            created += 1
+    return created
+
+
+def _sync_other_splits(dataset_root: Path, output_root: Path, processed_split: str) -> None:
+    """
+    同步除 processed_split 外的 split（如 val/test）到新数据集。
+    """
+    src_images_root = dataset_root / "images"
+    src_labels_root = dataset_root / "labels"
+
+    if not src_images_root.exists():
+        return
+
+    synced = []
+    generated_empty = 0
+    for split_dir in sorted(src_images_root.iterdir()):
+        if not split_dir.is_dir():
+            continue
+
+        split_name = split_dir.name
+        if split_name == processed_split:
+            continue
+
+        dst_img_dir = output_root / "images" / split_name
+        dst_label_dir = output_root / "labels" / split_name
+        shutil.copytree(split_dir, dst_img_dir, dirs_exist_ok=True)
+
+        src_label_dir = src_labels_root / split_name
+        if src_label_dir.exists():
+            shutil.copytree(src_label_dir, dst_label_dir, dirs_exist_ok=True)
+        else:
+            generated_empty += _ensure_split_labels(split_dir, dst_label_dir)
+
+        synced.append(split_name)
+
+    if synced:
+        logger.info(f"Synced additional splits: {synced}")
+    if generated_empty > 0:
+        logger.warning(
+            f"Source labels missing for some splits, generated {generated_empty} empty label files."
+        )
+
+
 # ==================== 主增强函数 ====================
 
 def augment_yolo_dataset(
@@ -386,6 +450,8 @@ def augment_yolo_dataset(
     enable_invert: bool = False,
     invert_prob: float = 0.02,  # v2.2: 概率触发
     clahe_position: str = "after_degradation",  # v2.2: CLAHE 位置控制
+    # 是否同步其他 split（val/test）
+    sync_other_splits: bool = False,
     # 原地修改开关
     in_place: bool = False,
     # 日志详细程度
@@ -450,8 +516,7 @@ def augment_yolo_dataset(
     logger.info("=" * 60)
     
     # 获取所有原始图片
-    extensions = ['.jpg', '.jpeg', '.png', '.bmp']
-    images = [p for p in input_dir.iterdir() if p.suffix.lower() in extensions]
+    images = [p for p in input_dir.iterdir() if _is_image_file(p)]
     original_images = [p for p in images if "_aug_" not in p.name]
     logger.info(f"Found {len(original_images)} original images")
     
@@ -537,6 +602,14 @@ def augment_yolo_dataset(
     logger.info("=" * 60)
     if not in_place:
         logger.info(f"Copied {count_copied} original samples")
+
+        # 可选：同步其他 split（如 val/test）
+        if sync_other_splits:
+            _sync_other_splits(
+                dataset_root=dataset_root,
+                output_root=output_root,
+                processed_split=image_dirname
+            )
         
         # 复制 data.yaml
         yaml_src = dataset_root / "data.yaml"
@@ -581,6 +654,8 @@ Example usage:
                         help="Path to images directory (e.g. data/stage1_detection/yolo_v3/images/train)")
     parser.add_argument("--output-root", type=Path, default=None, 
                         help="Root directory for the NEW dataset. Defaults to '{input_parent}_augmented'.")
+    parser.add_argument("--sync-splits", action="store_true",
+                        help="Also copy other splits (e.g., val/test) to output dataset.")
     parser.add_argument("--in-place", action="store_true",
                         help="WARNING: Augment in-place (modify original dataset). Overrides --output-root.")
     
@@ -642,6 +717,7 @@ Example usage:
         enable_invert=args.enable_invert,
         invert_prob=args.invert_prob,
         clahe_position=args.clahe_position,
+        sync_other_splits=args.sync_splits,
         in_place=args.in_place,
         verbose=args.verbose
     )

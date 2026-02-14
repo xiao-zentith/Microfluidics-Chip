@@ -33,7 +33,7 @@ python scripts/migrate_labels_to_single_class.py --data yolo_v3 --dry-run
 python scripts/migrate_labels_to_single_class.py --data yolo_v3
 ```
 
-### 1.2 分层离线增强 (v2.2)
+### 1.2 分层离线增强 (v2.3)
 
 | 档位 | 比例 | 光照强度 | 光子计数 | 适用场景 |
 |------|------|----------|----------|----------|
@@ -45,6 +45,7 @@ python scripts/migrate_labels_to_single_class.py --data yolo_v3
 - CLAHE 默认在退化**之后**执行，避免二次噪声放大
 - 每副本独立预处理，增加多样性
 - 质量控制机制，防止 extreme 产生不可用样本
+- 默认只增强 `train` split；如需同步 `val/test`，可加 `--sync-splits`
 
 ```bash
 # 推荐用法 (默认: multiplier=3, prob=0.7)
@@ -57,6 +58,11 @@ python scripts/augment_yolo_dataset.py \
     --multiplier 2 --prob 0.8 \
     --clahe-position before_degradation \
     --invert-prob 0.05 --verbose
+
+# 如果你已经有 val/test 并希望一并复制
+python scripts/augment_yolo_dataset.py \
+    --input data/stage1_detection/yolo_v3/images/train \
+    --sync-splits
 ```
 
 ---
@@ -146,7 +152,7 @@ Stage1 新增运行时质量控制，用于保护 Stage2 输入稳定性。
 | 类型 | 文件 | 功能 |
 |------|------|------|
 | 脚本 | `scripts/migrate_labels_to_single_class.py` | 标签迁移 |
-| 脚本 | `scripts/augment_yolo_dataset.py` (v2.2) | 离线增强 |
+| 脚本 | `scripts/augment_yolo_dataset.py` (v2.3) | 离线增强 |
 | 脚本 | `scripts/train_yolo.py` | YOLO 训练 |
 | 核心 | `stage1_detection/preprocess.py` | 统一预处理 |
 | 核心 | `stage1_detection/adaptive_detector.py` | 粗到精检测 |
@@ -169,8 +175,8 @@ python scripts/migrate_labels_to_single_class.py --data yolo_v3
 # Step 2: 数据增强
 python scripts/augment_yolo_dataset.py --input data/stage1_detection/yolo_v3/images/train
 
-# Step 3: 重新训练 YOLO
-python scripts/train_yolo.py --data yolo_datasetv3_augmented --name chambers_v21
+# Step 3: 重新训练 YOLO（无验证集时建议加 --no-val，设备默认 auto 会自动使用所有可见 GPU）
+python scripts/train_yolo.py --data yolo_v3_augmented --name chambers_v21 --no-val --device auto
 
 # Step 4: Stage1 自适应推理（单图）
 python -m microfluidics_chip.pipelines.cli stage1 \
