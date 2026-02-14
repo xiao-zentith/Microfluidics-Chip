@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.1] - 2026-02-14
+
+### 🎯 Stage1 Reliability Upgrade
+
+针对 Stage2 对 Stage1 结果高度依赖的问题，新增 Stage1 自适应运行控制能力：
+质量闸门、自动重试、失败回退和元数据质量追踪。
+
+### ✨ Added
+
+#### Stage1 质量闸门与重试策略
+- **运行时配置** (`core/config.py`)
+  - 新增 `AdaptiveRuntimeConfig`
+  - 支持 `enabled/max_attempts/preprocess_sequence`
+  - 支持质量阈值：`min_inlier_ratio/max_reprojection_error/min_mean_confidence` 等
+
+- **编排层增强** (`pipelines/stage1.py`)
+  - 自适应多轮重试：`raw -> clahe -> clahe_invert`
+  - 每轮自动调度 `coarse_conf/fine_conf/fine_imgsz`
+  - 质量闸门判定与综合评分择优
+  - 可配置回退到标准 `infer_stage1()`
+
+- **推理后处理抽象** (`stage1_detection/inference.py`)
+  - 新增 `infer_stage1_from_detections()`，统一标准/自适应路径的几何和GT处理逻辑
+
+#### Stage1 元数据可观测性
+- **新增字段** (`core/types.py`)
+  - `quality_metrics`
+  - `quality_gate_passed`
+  - `detection_mode`
+  - `retry_attempt`
+
+#### CLI 可控开关
+- **新增参数** (`pipelines/cli.py`)
+  - `stage1` / `stage1-batch` 支持 `--adaptive/--no-adaptive`
+
+#### 配置与依赖
+- **默认配置补齐** (`configs/default.yaml`)
+  - 新增 `stage1.adaptive_detection`
+  - 新增 `stage1.topology`
+  - 新增 `stage1.adaptive_runtime`
+
+- **依赖补齐** (`pyproject.toml`)
+  - 增加 `scikit-learn>=1.2.0`（DBSCAN 依赖）
+
+### 📝 Documentation
+
+- 更新 `README.md`：补充自适应 Stage1 命令示例
+- 更新 `docs/ADAPTIVE_DETECTION.md`：补充 v2.1 质量闸门与自动重试流程
+
+---
+
 ## [1.2.0] - 2026-02-05
 
 ### 🎯 Adaptive Detection Pipeline

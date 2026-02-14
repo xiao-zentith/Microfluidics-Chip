@@ -65,7 +65,8 @@ stage1_output = run_stage1(
     raw_image_path=Path("data/my_chip.png"),
     gt_image_path=None,
     output_dir=Path("runs/my_experiment/stage1"),
-    config=config.stage1
+    config=config.stage1,
+    use_adaptive=True  # 启用粗到精检测 + 质量闸门
 )
 
 # Stage2
@@ -74,6 +75,12 @@ stage2_output = run_stage2(
     output_dir=Path("runs/my_experiment/stage2"),
     config=config.stage2
 )
+
+# Stage1 metadata 包含:
+# - quality_metrics
+# - quality_gate_passed
+# - detection_mode
+# - retry_attempt
 ```
 
 ### With Custom Configuration

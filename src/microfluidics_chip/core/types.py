@@ -58,6 +58,10 @@ class Stage1Result(BaseModel):
     gt_slices: Optional[Any] = None  # np.ndarray (12, H, W, 3) uint8
     debug_vis: Optional[Any] = None  # np.ndarray
     processing_time: float = 0.0
+    quality_metrics: Optional[Dict[str, Any]] = None
+    quality_gate_passed: Optional[bool] = None
+    detection_mode: str = "standard"
+    retry_attempt: int = 0
 
 
 class Stage1Output(BaseModel):
@@ -79,6 +83,10 @@ class Stage1Output(BaseModel):
     num_chambers: int
     processing_time: float = 0.0
     has_gt_slices: bool = False
+    quality_metrics: Optional[Dict[str, Any]] = None
+    quality_gate_passed: Optional[bool] = None
+    detection_mode: str = "standard"
+    retry_attempt: int = 0
 
 
 # ==================== 自适应检测结果 ====================
@@ -166,7 +174,11 @@ def stage1_result_to_output(
         transform_params=result.transform_params,
         num_chambers=len(result.chambers),
         processing_time=result.processing_time,
-        has_gt_slices=(result.gt_slices is not None)
+        has_gt_slices=(result.gt_slices is not None),
+        quality_metrics=result.quality_metrics,
+        quality_gate_passed=result.quality_gate_passed,
+        detection_mode=result.detection_mode,
+        retry_attempt=result.retry_attempt
     )
 
 

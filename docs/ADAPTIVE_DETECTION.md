@@ -6,13 +6,14 @@
 
 ## 🎯 整体架构
 
-```
+```text
 ┌─────────────────────────── 数据层 ───────────────────────────┐
-│  单类别标签  →  分层增强 (mild/medium/extreme)  →  增强数据集  │
+│  单类别标签  ->  分层增强 (mild/medium/extreme)  ->  增强数据集  │
 └───────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────── 推理层 ───────────────────────────┐
-│  原图 → 粗扫描 → DBSCAN聚类 → ROI提取 → 精扫描 → 拓扑拟合 → 12腔室 │
+│  原图 -> 粗扫描 -> DBSCAN聚类 -> ROI提取 -> 精扫描 -> 拓扑拟合   │
+│        -> 质量闸门(拟合/误差/置信度) -> 通过 or 自动重试         │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -25,9 +26,11 @@
 将原有的 `chamber_dark` / `chamber_lit` 合并为统一的 `chamber` 类别，暗腔室判定移至推理层。
 
 ```bash
-python scripts/migrate_labels_to_single_class.py \
-    --root data/stage1_detection/yolo_v3 \
-    --dry-run  # 先预览
+# 先预览
+python scripts/migrate_labels_to_single_class.py --data yolo_v3 --dry-run
+
+# 确认后执行
+python scripts/migrate_labels_to_single_class.py --data yolo_v3
 ```
 
 ### 1.2 分层离线增强 (v2.2)
@@ -116,6 +119,26 @@ python scripts/augment_yolo_dataset.py \
 - 最少需要 4 个内点
 - 自动回填漏检腔室坐标
 
+### 2.3 质量闸门与自动重试 (v2.1)
+
+Stage1 新增运行时质量控制，用于保护 Stage2 输入稳定性。
+
+**闸门核心指标**：
+- `fit_success`
+- `inlier_ratio`
+- `reprojection_error`
+- `detection_count`
+- `cluster_score`
+- `mean_confidence`
+
+**默认策略**：
+- 最多重试 3 次
+- 预处理轮换：`raw -> clahe -> clahe_invert`
+- 每次重试降低 `coarse_conf/fine_conf`，并提升 `fine_imgsz`
+- 若仍不达标，可回退标准检测流程
+
+**关键配置位置**：`configs/default.yaml` -> `stage1.adaptive_runtime`
+
 ---
 
 ## 🛠️ 关键文件
@@ -124,11 +147,15 @@ python scripts/augment_yolo_dataset.py \
 |------|------|------|
 | 脚本 | `scripts/migrate_labels_to_single_class.py` | 标签迁移 |
 | 脚本 | `scripts/augment_yolo_dataset.py` (v2.2) | 离线增强 |
+| 脚本 | `scripts/train_yolo.py` | YOLO 训练 |
 | 核心 | `stage1_detection/preprocess.py` | 统一预处理 |
 | 核心 | `stage1_detection/adaptive_detector.py` | 粗到精检测 |
 | 核心 | `stage1_detection/topology_fitter.py` | RANSAC 拟合 |
 | 入口 | `stage1_detection/inference.py` | `infer_stage1_adaptive()` |
+| 编排 | `pipelines/stage1.py` | 质量闸门 + 自动重试 |
+| 配置 | `core/config.py` | `AdaptiveRuntimeConfig` |
 | 配置 | `configs/adaptive_detection.yaml` | 参数模板 |
+| 配置 | `configs/default.yaml` | 运行策略默认值 |
 | 示例 | `examples/adaptive_detection_demo.py` | 端到端演示 |
 
 ---
@@ -137,17 +164,33 @@ python scripts/augment_yolo_dataset.py \
 
 ```bash
 # Step 1: 标签迁移
-python scripts/migrate_labels_to_single_class.py --root data/stage1_detection/yolo_v3
+python scripts/migrate_labels_to_single_class.py --data yolo_v3
 
 # Step 2: 数据增强
 python scripts/augment_yolo_dataset.py --input data/stage1_detection/yolo_v3/images/train
 
 # Step 3: 重新训练 YOLO
-python scripts/train_yolo.py --data data/stage1_detection/yolo_v3_augmented/data.yaml
+python scripts/train_yolo.py --data yolo_datasetv3_augmented --name chambers_v21
 
-# Step 4: 使用自适应推理
-python examples/adaptive_detection_demo.py --image test.jpg --weights weights/best.pt
+# Step 4: Stage1 自适应推理（单图）
+python -m microfluidics_chip.pipelines.cli stage1 \
+  data/chip001.png \
+  -o data/experiments/stage1 \
+  --adaptive
+
+# Step 5: Stage1 自适应推理（批量）
+python -m microfluidics_chip.pipelines.cli stage1-batch \
+  data/images \
+  -o data/experiments/stage1_batch \
+  --adaptive
+
+# Step 6: Stage2（仅接收通过 Stage1 的目录）
+python -m microfluidics_chip.pipelines.cli stage2 \
+  data/experiments/stage1/chip001 \
+  -o data/experiments/stage2
 ```
+
+`stage1_metadata.json` 将记录 `quality_metrics`、`quality_gate_passed`、`detection_mode`、`retry_attempt`。
 
 ---
 

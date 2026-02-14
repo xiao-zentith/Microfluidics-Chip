@@ -35,12 +35,6 @@ class GeometryConfig(BaseModel):
     class_id_lit: int = Field(default=1, description="点亮腔类别ID")
 
 
-class Stage1Config(BaseModel):
-    """Stage1 完整配置"""
-    yolo: YOLOConfig
-    geometry: GeometryConfig
-
-
 # ==================== 自适应检测配置 ====================
 
 class AdaptiveDetectionConfig(BaseModel):
@@ -84,6 +78,45 @@ class TopologyConfig(BaseModel):
     
     # 回退参数
     fallback_to_affine: bool = Field(default=True, description="Similarity 失败时是否回退到 Affine")
+
+
+class AdaptiveRuntimeConfig(BaseModel):
+    """Stage1 自适应推理运行策略配置"""
+    enabled: bool = Field(default=False, description="是否启用自适应粗到精检测流程")
+    max_attempts: int = Field(default=3, ge=1, le=6, description="最大重试次数")
+    preprocess_sequence: List[str] = Field(
+        default_factory=lambda: ["raw", "clahe", "clahe_invert"],
+        description="重试预处理序列，可选值: raw/clahe/clahe_invert"
+    )
+
+    # 质量闸门
+    require_fit_success: bool = Field(default=True, description="是否要求拓扑拟合成功")
+    min_detections: int = Field(default=8, ge=0, le=12, description="最少粗细检出数")
+    min_inlier_ratio: float = Field(default=0.40, ge=0.0, le=1.0, description="最小RANSAC内点比例")
+    max_reprojection_error: float = Field(default=35.0, ge=0.0, description="最大重投影误差（像素）")
+    min_cluster_score: float = Field(default=0.20, ge=0.0, le=1.0, description="最小聚类质量得分")
+    min_mean_confidence: float = Field(default=0.15, ge=0.0, le=1.0, description="最小平均置信度")
+
+    # 重试调度
+    confidence_decay: float = Field(default=0.85, gt=0.0, le=1.0, description="每次重试置信度衰减系数")
+    min_coarse_conf: float = Field(default=0.03, ge=0.0, le=1.0, description="粗检最小置信度")
+    min_fine_conf: float = Field(default=0.12, ge=0.0, le=1.0, description="细检最小置信度")
+    fine_imgsz_step: int = Field(default=128, ge=0, description="每次重试细检分辨率增量")
+
+    # 兜底策略
+    fallback_to_standard: bool = Field(default=True, description="质量闸门失败后是否回退到标准流程")
+    force_blank_if_missing: bool = Field(default=True, description="缺少blank类别时是否强制补一个blank锚点")
+
+
+class Stage1Config(BaseModel):
+    """Stage1 完整配置"""
+    yolo: YOLOConfig
+    geometry: GeometryConfig
+
+    # v2.1: 可选自适应流程配置（默认关闭，兼容旧行为）
+    adaptive_detection: Optional[AdaptiveDetectionConfig] = None
+    topology: Optional[TopologyConfig] = None
+    adaptive_runtime: Optional[AdaptiveRuntimeConfig] = None
 
 
 # ==================== Stage2 配置 ====================

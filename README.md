@@ -62,7 +62,8 @@ weights/
 # Stage1: 检测与切片
 python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
-  -o data/experiments/stage1
+  -o data/experiments/stage1 \
+  --adaptive
 
 # Stage2: 光照校正
 python -m microfluidics_chip.pipelines.cli stage2 \
@@ -102,14 +103,27 @@ python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
   -o data/experiments/debug \
   --save-slices \
-  --save-debug
+  --save-debug \
+  --adaptive
 
 # 使用自定义配置
 python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
   -o data/experiments/stage1 \
   --config configs/my_config.yaml
+
+# 显式关闭自适应检测（走标准一次检测）
+python -m microfluidics_chip.pipelines.cli stage1 \
+  data/chip001.png \
+  -o data/experiments/stage1 \
+  --no-adaptive
 ```
+
+启用 `--adaptive` 时，`stage1_metadata.json` 会额外包含：
+- `quality_metrics`
+- `quality_gate_passed`
+- `detection_mode`
+- `retry_attempt`
 
 #### Stage2 处理
 

@@ -29,6 +29,49 @@ stage1:
     class_id_blank: 0
     class_id_lit: 1
 
+  # 自适应检测参数（粗到精）
+  adaptive_detection:
+    coarse_imgsz: 640
+    coarse_conf: 0.08
+    fine_imgsz: 1280
+    fine_conf: 0.3
+    cluster_eps: 100.0
+    cluster_min_samples: 3
+    roi_margin: 1.3
+    min_roi_size: 200
+    enable_clahe: true
+    clahe_clip_limit: 2.0
+
+  # 拓扑拟合参数
+  topology:
+    template_scale: 50.0
+    template_path: null
+    ransac_iters: 200
+    ransac_threshold: 25.0
+    min_inliers: 4
+    visibility_margin: 10
+    brightness_roi_size: 30
+    dark_percentile: 25.0
+    fallback_to_affine: true
+
+  # 自适应运行策略（默认关闭，按需通过 CLI 或配置启用）
+  adaptive_runtime:
+    enabled: false
+    max_attempts: 3
+    preprocess_sequence: ["raw", "clahe", "clahe_invert"]
+    require_fit_success: true
+    min_detections: 8
+    min_inlier_ratio: 0.4
+    max_reprojection_error: 35.0
+    min_cluster_score: 0.2
+    min_mean_confidence: 0.15
+    confidence_decay: 0.85
+    min_coarse_conf: 0.03
+    min_fine_conf: 0.12
+    fine_imgsz_step: 128
+    fallback_to_standard: true
+    force_blank_if_missing: true
+
 # Stage2: UNet光照校正
 stage2:
   model:

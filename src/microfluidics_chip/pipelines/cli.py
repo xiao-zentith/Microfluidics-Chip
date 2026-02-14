@@ -73,6 +73,11 @@ def stage1_command(
     config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
     save_individual_slices: bool = typer.Option(False, "--save-slices", help="保存单个切片图像（调试用）"),
     save_debug: bool = typer.Option(True, "--save-debug/--no-save-debug", help="保存检测调试图像"),
+    adaptive: Optional[bool] = typer.Option(
+        None,
+        "--adaptive/--no-adaptive",
+        help="启用自适应粗到精检测 + 质量闸门（默认跟随配置文件）"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
 ):
     """
@@ -107,7 +112,8 @@ def stage1_command(
             output_dir=output_dir,
             config=config.stage1,
             save_individual_slices=save_individual_slices,
-            save_debug=save_debug
+            save_debug=save_debug,
+            use_adaptive=adaptive
         )
         
         # 显示结果
@@ -134,6 +140,11 @@ def stage1_batch_command(
     output_dir: Path = typer.Option("runs/stage1", "--output", "-o", help="输出目录"),
     config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
     gt_suffix: str = typer.Option("_gt", "--gt-suffix", help="GT文件后缀"),
+    adaptive: Optional[bool] = typer.Option(
+        None,
+        "--adaptive/--no-adaptive",
+        help="启用自适应粗到精检测 + 质量闸门（默认跟随配置文件）"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
 ):
     """
@@ -160,7 +171,8 @@ def stage1_batch_command(
             input_dir=input_dir,
             output_dir=output_dir,
             config=config.stage1,
-            gt_suffix=gt_suffix
+            gt_suffix=gt_suffix,
+            use_adaptive=adaptive
         )
         
         # 显示结果

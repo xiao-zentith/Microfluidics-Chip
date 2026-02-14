@@ -9,7 +9,7 @@ v2.0 新增：
 
 import time
 import numpy as np
-from typing import Optional, Tuple, List
+from typing import Optional, List, Dict, Any
 from ..core.types import Stage1Result, ChamberDetection, AdaptiveDetectionResult
 from ..core.config import Stage1Config, AdaptiveDetectionConfig, TopologyConfig
 from ..core.logger import get_logger
@@ -19,6 +19,99 @@ from .adaptive_detector import AdaptiveDetector, AdaptiveDetectionConfig as Adap
 from .topology_fitter import TopologyFitter, TopologyConfig as TopoConfig
 
 logger = get_logger("stage1_detection.inference")
+
+
+def infer_stage1_from_detections(
+    chip_id: str,
+    raw_image: np.ndarray,
+    gt_image: Optional[np.ndarray],
+    detections_raw: List[ChamberDetection],
+    config: Stage1Config,
+    detector: Optional[ChamberDetector] = None,
+    geometry_engine: Optional[CrossGeometryEngine] = None,
+    quality_metrics: Optional[Dict[str, Any]] = None,
+    quality_gate_passed: Optional[bool] = None,
+    detection_mode: str = "standard",
+    retry_attempt: int = 0
+) -> Stage1Result:
+    """
+    使用已给定的检测结果执行 Stage1 几何校正与切片提取。
+
+    该函数用于统一标准流程和自适应流程的后处理逻辑，确保：
+    - 几何处理一致
+    - GT 处理保持 P3（独立 geometry engine）
+    - Result 输出字段一致（包含质量指标）
+    """
+    start_time = time.time()
+
+    if len(detections_raw) < 12:
+        raise ValueError(f"Chip {chip_id}: Only {len(detections_raw)} chambers detected")
+
+    if geometry_engine is None:
+        geometry_engine = CrossGeometryEngine(config.geometry)
+        logger.info("Initialized new CrossGeometryEngine")
+
+    # ==================== 几何校正 Raw 图像 ====================
+    logger.info(f"[{chip_id}] Processing geometry for raw image...")
+    aligned_image, chamber_slices, transform_params, debug_vis = geometry_engine.process(
+        raw_image, detections_raw
+    )
+
+    if aligned_image is None:
+        logger.error(f"[{chip_id}] Geometry processing failed")
+        raise RuntimeError(f"Chip {chip_id}: Geometry processing failed")
+
+    logger.info(f"[{chip_id}] Geometry processing complete: {len(chamber_slices)} slices extracted")
+
+    # ==================== P3: GT 处理（独立引擎） ====================
+    gt_slices = None
+    if gt_image is not None:
+        if detector is None:
+            detector = ChamberDetector(config.yolo)
+
+        logger.info(f"[{chip_id}] Processing GT image with INDEPENDENT engine (P3)")
+
+        # P3 关键：实例化独立引擎
+        gt_engine = CrossGeometryEngine(config.geometry)
+
+        # 检测 GT
+        detections_gt = detector.detect(gt_image)
+
+        if len(detections_gt) >= 12:
+            # 使用独立引擎处理
+            _, gt_slices_array, _, _ = gt_engine.process(gt_image, detections_gt)
+
+            if gt_slices_array is not None:
+                gt_slices = gt_slices_array
+                logger.info(f"[{chip_id}] GT processing complete: {len(gt_slices)} slices")
+            else:
+                logger.warning(f"[{chip_id}] GT geometry processing failed")
+        else:
+            logger.warning(f"[{chip_id}] Insufficient GT detections: {len(detections_gt)}")
+
+    # ==================== 计算耗时 ====================
+    processing_time = time.time() - start_time
+
+    # ==================== 返回内存结果 ====================
+    result = Stage1Result(
+        chip_id=chip_id,
+        aligned_image=aligned_image,
+        chamber_slices=chamber_slices,
+        transform_params=transform_params,
+        chambers=detections_raw,
+        gt_slices=gt_slices,
+        debug_vis=debug_vis,
+        processing_time=processing_time,
+        quality_metrics=quality_metrics,
+        quality_gate_passed=quality_gate_passed,
+        detection_mode=detection_mode,
+        retry_attempt=retry_attempt
+    )
+
+    logger.info(
+        f"[{chip_id}] Stage1 inference ({detection_mode}) complete in {processing_time:.2f}s"
+    )
+    return result
 
 
 def infer_stage1(
@@ -50,79 +143,32 @@ def infer_stage1(
     :param geometry_engine: CrossGeometryEngine 实例（批处理时复用）
     :return: Stage1Result（内存对象）
     """
-    start_time = time.time()
-    
     # ==================== 实例化（如果未提供） ====================
     if detector is None:
         detector = ChamberDetector(config.yolo)
         logger.info("Initialized new ChamberDetector")
-    
-    if geometry_engine is None:
-        geometry_engine = CrossGeometryEngine(config.geometry)
-        logger.info("Initialized new CrossGeometryEngine")
-    
+
     # ==================== 检测 Raw 图像 ====================
     logger.info(f"[{chip_id}] Detecting chambers in raw image...")
     detections_raw = detector.detect(raw_image)
-    
+
     if len(detections_raw) < 12:
         logger.error(f"[{chip_id}] Insufficient detections: {len(detections_raw)} < 12")
         raise ValueError(f"Chip {chip_id}: Only {len(detections_raw)} chambers detected")
-    
+
     logger.info(f"[{chip_id}] Detected {len(detections_raw)} chambers")
-    
-    # ==================== 几何校正 Raw 图像 ====================
-    logger.info(f"[{chip_id}] Processing geometry for raw image...")
-    aligned_image, chamber_slices, transform_params, debug_vis = geometry_engine.process(
-        raw_image, detections_raw
-    )
-    
-    if aligned_image is None:
-        logger.error(f"[{chip_id}] Geometry processing failed")
-        raise RuntimeError(f"Chip {chip_id}: Geometry processing failed")
-    
-    logger.info(f"[{chip_id}] Geometry processing complete: {len(chamber_slices)} slices extracted")
-    
-    # ==================== P3: GT 处理（独立引擎） ====================
-    gt_slices = None
-    if gt_image is not None:
-        logger.info(f"[{chip_id}] Processing GT image with INDEPENDENT engine (P3)")
-        
-        # P3 关键：实例化独立引擎
-        gt_engine = CrossGeometryEngine(config.geometry)
-        
-        # 检测 GT
-        detections_gt = detector.detect(gt_image)
-        
-        if len(detections_gt) >= 12:
-            # 使用独立引擎处理
-            _, gt_slices_array, _, _ = gt_engine.process(gt_image, detections_gt)
-            
-            if gt_slices_array is not None:
-                gt_slices = gt_slices_array
-                logger.info(f"[{chip_id}] GT processing complete: {len(gt_slices)} slices")
-            else:
-                logger.warning(f"[{chip_id}] GT geometry processing failed")
-        else:
-            logger.warning(f"[{chip_id}] Insufficient GT detections: {len(detections_gt)}")
-    
-    # ==================== 计算耗时 ====================
-    processing_time = time.time() - start_time
-    
-    # ==================== 返回内存结果 ====================
-    result = Stage1Result(
+
+    return infer_stage1_from_detections(
         chip_id=chip_id,
-        aligned_image=aligned_image,
-        chamber_slices=chamber_slices,
-        transform_params=transform_params,
-        chambers=detections_raw,  # P0: List[ChamberDetection]
-        gt_slices=gt_slices,
-        debug_vis=debug_vis,
-        processing_time=processing_time
+        raw_image=raw_image,
+        gt_image=gt_image,
+        detections_raw=detections_raw,
+        config=config,
+        detector=detector,
+        geometry_engine=geometry_engine,
+        detection_mode="standard",
+        retry_attempt=0
     )
-    
-    logger.info(f"[{chip_id}] Stage1 inference complete in {processing_time:.2f}s")
-    return result
 
 
 # ==================== 自适应推理入口 (v2.0) ====================
@@ -252,4 +298,3 @@ def infer_stage1_adaptive(
     logger.info(f"[{chip_id}] Adaptive Stage1 complete in {processing_time:.2f}s")
     
     return result
-
