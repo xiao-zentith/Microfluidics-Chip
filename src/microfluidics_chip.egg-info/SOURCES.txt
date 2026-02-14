@@ -1,3 +1,4 @@
+README.md
 pyproject.toml
 src/microfluidics_chip/__init__.py
 src/microfluidics_chip.egg-info/PKG-INFO
@@ -21,9 +22,12 @@ src/microfluidics_chip/stage1_detection/geometry_engine.py
 src/microfluidics_chip/stage1_detection/inference.py
 src/microfluidics_chip/stage1_detection/synthesizer.py
 src/microfluidics_chip/stage2_correction/__init__.py
+src/microfluidics_chip/stage2_correction/augmentations.py
 src/microfluidics_chip/stage2_correction/dataset.py
+src/microfluidics_chip/stage2_correction/evaluation.py
 src/microfluidics_chip/stage2_correction/inference.py
 src/microfluidics_chip/stage2_correction/losses.py
 src/microfluidics_chip/stage2_correction/trainer.py
 src/microfluidics_chip/stage2_correction/models/__init__.py
 src/microfluidics_chip/stage2_correction/models/dual_stream_unet.py
+src/microfluidics_chip/stage2_correction/models/single_stream_unet.py
