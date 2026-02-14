@@ -10,6 +10,12 @@ YOLO 目标检测训练脚本
     
     # 基本训练
     python scripts/train_yolo.py --data yolo_v3 --name chambers_v1
+
+    # 单卡训练（指定 GPU0）
+    python scripts/train_yolo.py --data yolo_v3 --name chambers_v1 --mode single --gpus 0
+
+    # 多卡训练（自动使用全部可见 GPU）
+    python scripts/train_yolo.py --data yolo_v3 --name chambers_v1 --mode multi --gpus all
     
     # 无验证集训练（val 缺失时推荐）
     python scripts/train_yolo.py --data yolo_v3 --name chambers_v1 --no-val
@@ -25,7 +31,7 @@ import argparse
 import sys
 from pathlib import Path
 import yaml
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 # 确保项目根目录在 Python 路径中
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +93,95 @@ def resolve_device(device_arg: str) -> Tuple[str, Optional[int]]:
     return all_gpus, gpu_count
 
 
+def get_visible_gpu_ids() -> List[int]:
+    """返回当前进程可见的 GPU id 列表（基于 torch 可见设备）。"""
+    try:
+        import torch
+    except Exception:
+        return []
+
+    if not torch.cuda.is_available():
+        return []
+
+    return list(range(torch.cuda.device_count()))
+
+
+def parse_gpu_selector(gpus_arg: str, visible_gpu_ids: List[int]) -> List[int]:
+    """
+    解析 --gpus 参数。
+
+    支持:
+    - all
+    - 逗号分隔 id，如 0,1
+    """
+    if not visible_gpu_ids:
+        return []
+
+    if str(gpus_arg).strip().lower() == "all":
+        return visible_gpu_ids.copy()
+
+    selected: List[int] = []
+    for token in str(gpus_arg).split(","):
+        token = token.strip()
+        if token == "":
+            continue
+        if not token.isdigit():
+            raise ValueError(f"非法 GPU id: {token}")
+        gpu_id = int(token)
+        if gpu_id not in visible_gpu_ids:
+            raise ValueError(f"GPU id {gpu_id} 不在可见范围 {visible_gpu_ids}")
+        if gpu_id not in selected:
+            selected.append(gpu_id)
+
+    return selected
+
+
+def resolve_training_device(
+    mode: str,
+    gpus_arg: str,
+    device_override: Optional[str]
+) -> Tuple[str, int, str]:
+    """
+    解析最终训练 device 与使用卡数。
+
+    优先级:
+    1) --device 覆盖（兼容 Ultralytics 原生参数）
+    2) --mode + --gpus
+    """
+    if device_override is not None:
+        resolved, count = resolve_device(device_override)
+        return resolved, count or 0, f"override({device_override})"
+
+    mode = mode.lower().strip()
+    visible_gpu_ids = get_visible_gpu_ids()
+
+    if mode == "cpu":
+        return "cpu", 0, "mode=cpu"
+
+    if not visible_gpu_ids:
+        if mode in {"single", "multi"}:
+            raise ValueError("当前无可见 GPU，无法使用 single/multi 模式。")
+        return "cpu", 0, "auto-fallback-cpu"
+
+    selected = parse_gpu_selector(gpus_arg, visible_gpu_ids)
+    if not selected:
+        selected = visible_gpu_ids.copy()
+
+    if mode == "single":
+        selected = [selected[0]]
+    elif mode == "multi":
+        if len(selected) < 2:
+            raise ValueError(
+                f"multi 模式需要至少 2 张 GPU，当前选择为 {selected}。"
+            )
+    elif mode != "auto":
+        raise ValueError(f"不支持的 mode: {mode}")
+    # auto: 保持 selected 原样（默认 all）
+
+    device = ",".join(str(x) for x in selected) if len(selected) > 1 else str(selected[0])
+    return device, len(selected), f"mode={mode}, gpus={selected}"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="YOLO 目标检测训练脚本",
@@ -95,6 +190,13 @@ def main():
 示例:
     # 基本训练
     python scripts/train_yolo.py --data yolo_v3 --name chambers_v1
+
+    # 单卡训练（GPU0）
+    python scripts/train_yolo.py --data yolo_v3 --name chambers_v1 --mode single --gpus 0
+
+    # 多卡训练（全部 GPU），并按每卡 batch 自动计算总 batch
+    python scripts/train_yolo.py --data yolo_v3 --name chambers_v1 \\
+        --mode multi --gpus all --batch-per-gpu 8
     
     # 无验证集训练
     python scripts/train_yolo.py --data yolo_v3 --name chambers_v1 --no-val
@@ -128,7 +230,31 @@ def main():
     parser.add_argument("--epochs", "-e", type=int, default=100, help="训练轮数, 默认: 100")
     parser.add_argument("--imgsz", type=int, default=640, help="输入图像尺寸, 默认: 640")
     parser.add_argument("--batch", "-b", type=int, default=16, help="批次大小, 默认: 16")
-    parser.add_argument("--device", type=str, default="auto", help="设备 (auto, 0, 0,1, cpu), 默认: auto")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["auto", "single", "multi", "cpu"],
+        default="auto",
+        help="训练模式: auto/single/multi/cpu, 默认: auto"
+    )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default="all",
+        help="GPU 选择: all 或逗号分隔 id (如 0,1), 默认: all"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="高级覆盖参数（直接传给 Ultralytics device，如 0,1 或 cpu），优先级最高"
+    )
+    parser.add_argument(
+        "--batch-per-gpu",
+        type=int,
+        default=None,
+        help="按每卡 batch 自动计算总 batch（总batch = 每卡batch x GPU数量）"
+    )
     parser.add_argument("--name", "-n", type=str, default="train", help="实验名称, 默认: train")
     
     # 数据增强参数
@@ -219,7 +345,25 @@ def main():
         with open(effective_data_yaml, "w", encoding="utf-8") as f:
             yaml.safe_dump(data_cfg, f, allow_unicode=True, sort_keys=False)
 
-    resolved_device, gpu_count = resolve_device(args.device)
+    try:
+        resolved_device, gpu_count, device_strategy = resolve_training_device(
+            mode=args.mode,
+            gpus_arg=args.gpus,
+            device_override=args.device
+        )
+    except ValueError as e:
+        print(f"错误: 设备参数无效: {e}")
+        sys.exit(1)
+
+    effective_batch = args.batch
+    if args.batch_per_gpu is not None:
+        if args.batch_per_gpu <= 0:
+            print("错误: --batch-per-gpu 必须为正整数")
+            sys.exit(1)
+        if gpu_count > 0:
+            effective_batch = args.batch_per_gpu * gpu_count
+        else:
+            effective_batch = args.batch_per_gpu
     
     # 构建输出路径 (使用绝对路径，避免全局配置干扰)
     project_dir = get_absolute_path("data/experiments/yolo")
@@ -233,14 +377,15 @@ def main():
     print(f"  模型:       {args.model}")
     print(f"  轮数:       {args.epochs}")
     print(f"  图像尺寸:   {args.imgsz}")
-    print(f"  批次大小:   {args.batch}")
+    print(f"  批次大小:   {effective_batch}")
     print(f"  设备:       {resolved_device}")
+    print(f"  设备策略:   {device_strategy}")
     print(f"  训练集样本: {train_count}")
     if no_val_mode:
         print("  验证模式:   关闭 (no-val)")
     else:
         print(f"  验证集样本: {val_count}")
-    if gpu_count is not None and gpu_count > 1:
+    if gpu_count > 1:
         print(f"  GPU数量:    {gpu_count} (多卡并行)")
     print("=" * 60)
     
@@ -260,7 +405,7 @@ def main():
             data=str(effective_data_yaml),
             epochs=args.epochs,
             imgsz=args.imgsz,
-            batch=args.batch,
+            batch=effective_batch,
             device=resolved_device,
             project=project_dir,  # 使用绝对路径
             name=args.name,

@@ -175,8 +175,15 @@ python scripts/migrate_labels_to_single_class.py --data yolo_v3
 # Step 2: 数据增强
 python scripts/augment_yolo_dataset.py --input data/stage1_detection/yolo_v3/images/train
 
-# Step 3: 重新训练 YOLO（无验证集时建议加 --no-val，设备默认 auto 会自动使用所有可见 GPU）
-python scripts/train_yolo.py --data yolo_v3_augmented --name chambers_v21 --no-val --device auto
+# Step 3: 重新训练 YOLO（无验证集时建议加 --no-val）
+# 自动模式（推荐）：自动选择可见 GPU（1 卡=单卡，>=2 卡=多卡）
+python scripts/train_yolo.py --data yolo_v3_augmented --name chambers_v21 --no-val --mode auto --gpus all
+
+# 单卡模式（示例：只用 GPU0）
+python scripts/train_yolo.py --data yolo_v3_augmented --name chambers_v21 --no-val --mode single --gpus 0
+
+# 多卡模式（示例：GPU0,1；每卡 batch=8，总 batch=16）
+python scripts/train_yolo.py --data yolo_v3_augmented --name chambers_v21 --no-val --mode multi --gpus 0,1 --batch-per-gpu 8
 
 # Step 4: Stage1 自适应推理（单图）
 python -m microfluidics_chip.pipelines.cli stage1 \
