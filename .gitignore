@@ -49,3 +49,6 @@ logs/
 wandb/
 tensorboard/
 *.log
+
+# 暂时保留deprecated文件夹，后续清理
+deprecated/
