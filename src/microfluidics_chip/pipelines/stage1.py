@@ -12,6 +12,8 @@ v2.1 增强：
 
 import cv2
 import numpy as np
+import json
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any
 from tqdm import tqdm
@@ -30,6 +32,39 @@ from ..stage1_detection.preprocess import preprocess_image
 from ..stage1_detection.inference import infer_stage1, infer_stage1_adaptive, infer_stage1_from_detections
 
 logger = get_logger("pipelines.stage1")
+
+
+def _draw_yolo_detections(raw_image: np.ndarray, detections: List[ChamberDetection]) -> np.ndarray:
+    """
+    绘制 YOLO 原始检测结果（不做几何/拓扑后处理）。
+    """
+    vis = raw_image.copy()
+
+    for det in detections:
+        x, y, w, h = det.bbox
+        x2, y2 = x + w, y + h
+        color = (0, 255, 0) if det.class_id == 0 else (0, 165, 255)
+
+        cv2.rectangle(vis, (x, y), (x2, y2), color, 2)
+        cx, cy = int(det.center[0]), int(det.center[1])
+        cv2.circle(vis, (cx, cy), 3, (255, 255, 255), -1)
+
+        label = f"class={det.class_id} conf={det.confidence:.3f}"
+        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        ty = max(y, th + baseline + 4)
+        cv2.rectangle(vis, (x, ty - th - baseline - 4), (x + tw + 4, ty), color, -1)
+        cv2.putText(
+            vis,
+            label,
+            (x + 2, ty - baseline - 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return vis
 
 
 def _resolve_runtime_config(
@@ -485,6 +520,111 @@ def run_stage1(
     logger.info(f"[{chip_id}] Files: stage1_metadata.json, aligned.png, chamber_slices.npz")
     
     return output
+
+
+def run_stage1_yolo_only(
+    chip_id: str,
+    raw_image_path: Path,
+    output_dir: Path,
+    config: Stage1Config,
+    detector: Optional[ChamberDetector] = None,
+) -> Dict[str, Any]:
+    """
+    仅执行 YOLO 检测，不进行 Stage1 后处理（几何校正/拓扑拟合/切片）。
+
+    输出文件:
+    - raw.png
+    - yolo_raw_detections.png
+    - yolo_raw_detections.json
+    """
+    start = time.time()
+
+    raw_image = cv2.imread(str(raw_image_path))
+    if raw_image is None:
+        raise FileNotFoundError(f"Cannot read raw image: {raw_image_path}")
+
+    if detector is None:
+        detector = ChamberDetector(config.yolo)
+
+    detections = detector.detect(raw_image)
+    vis = _draw_yolo_detections(raw_image, detections)
+
+    run_dir = Path(output_dir) / chip_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_name = "raw.png"
+    vis_name = "yolo_raw_detections.png"
+    meta_name = "yolo_raw_detections.json"
+
+    cv2.imwrite(str(run_dir / raw_name), raw_image)
+    cv2.imwrite(str(run_dir / vis_name), vis)
+
+    payload: Dict[str, Any] = {
+        "chip_id": chip_id,
+        "raw_image_path": raw_name,
+        "visualization_path": vis_name,
+        "num_detections": len(detections),
+        "detections": [d.model_dump() for d in detections],
+        "processing_time": time.time() - start,
+    }
+
+    with open(run_dir / meta_name, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        f"[{chip_id}] YOLO-only inference saved: {run_dir / vis_name} "
+        f"(detections={len(detections)})"
+    )
+    return payload
+
+
+def run_stage1_yolo_only_batch(
+    input_dir: Path,
+    output_dir: Path,
+    config: Stage1Config,
+    image_extensions: List[str] = [".png", ".jpg", ".jpeg"],
+    skip_suffix: str = "_gt",
+) -> List[Dict[str, Any]]:
+    """
+    批量 YOLO-only 推理（不进行后处理）。
+    """
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image_paths: List[Path] = []
+    for ext in image_extensions:
+        for p in input_dir.glob(f"*{ext}"):
+            if skip_suffix and skip_suffix in p.stem:
+                continue
+            image_paths.append(p)
+
+    if not image_paths:
+        logger.warning(f"No image files found in {input_dir}")
+        return []
+
+    logger.info(f"Found {len(image_paths)} images for YOLO-only batch inference")
+    detector = ChamberDetector(config.yolo)
+
+    outputs: List[Dict[str, Any]] = []
+    for p in tqdm(image_paths, desc="YOLO-only stage1"):
+        chip_id = p.stem
+        try:
+            out = run_stage1_yolo_only(
+                chip_id=chip_id,
+                raw_image_path=p,
+                output_dir=output_dir,
+                config=config,
+                detector=detector,
+            )
+            outputs.append(out)
+        except Exception as e:
+            logger.error(f"✗ {chip_id} failed in YOLO-only mode: {e}")
+
+    logger.info(
+        f"YOLO-only batch complete: {len(outputs)} success, {len(image_paths) - len(outputs)} failed"
+    )
+    return outputs
 
 
 def run_stage1_batch(

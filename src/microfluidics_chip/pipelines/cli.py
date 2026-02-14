@@ -4,6 +4,8 @@ CLI 统一入口（使用 Typer）
 命令：
 - stage1: 处理单个图像
 - stage1-batch: 批量处理
+- stage1-yolo: 仅 YOLO 检测（无后处理）
+- stage1-yolo-batch: 批量仅 YOLO 检测（无后处理）
 - stage2: Stage2 处理（只接受 --stage1-run-dir）
 - train: 训练 UNet 模型
 
@@ -27,7 +29,12 @@ from ..core.config import (
     MicrofluidicsConfig
 )
 from ..core.logger import setup_logger
-from ..pipelines.stage1 import run_stage1, run_stage1_batch
+from ..pipelines.stage1 import (
+    run_stage1,
+    run_stage1_batch,
+    run_stage1_yolo_only,
+    run_stage1_yolo_only_batch,
+)
 from ..pipelines.stage2 import run_stage2, run_stage2_batch
 
 # 创建 Typer 应用
@@ -178,6 +185,80 @@ def stage1_batch_command(
         # 显示结果
         console.print(f"[bold green]✓ Processed {len(outputs)} chips successfully![/bold green]")
         
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+
+
+@app.command(name="stage1-yolo")
+def stage1_yolo_command(
+    raw_image: Path = typer.Argument(..., help="原始图像路径"),
+    output_dir: Path = typer.Option("runs/stage1_yolo", "--output", "-o", help="输出目录"),
+    chip_id: Optional[str] = typer.Option(None, "--chip-id", help="芯片ID（默认从文件名提取）"),
+    config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    confidence: Optional[float] = typer.Option(None, "--conf", min=0.0, max=1.0, help="YOLO置信度阈值覆盖"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
+):
+    """
+    仅执行 YOLO 检测（不进行 Stage1 后处理），并保存可视化结果。
+    """
+    if chip_id is None:
+        chip_id = raw_image.stem
+
+    log_level = "DEBUG" if verbose else "INFO"
+    setup_logger(level=log_level, log_file=output_dir / chip_id / "stage1_yolo_execution.log")
+
+    config = load_merged_config(config_file)
+    if confidence is not None:
+        config.stage1.yolo.confidence_threshold = confidence
+
+    try:
+        payload = run_stage1_yolo_only(
+            chip_id=chip_id,
+            raw_image_path=raw_image,
+            output_dir=output_dir,
+            config=config.stage1,
+        )
+
+        table = Table(title=f"Stage1 YOLO-only Output: {chip_id}")
+        table.add_column("Key", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Chip ID", payload["chip_id"])
+        table.add_row("Detections", str(payload["num_detections"]))
+        table.add_row("Processing Time", f"{payload['processing_time']:.2f}s")
+        table.add_row("Output Directory", str(output_dir / chip_id))
+        console.print(table)
+        console.print("[bold green]✓ Stage1 YOLO-only complete![/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+
+
+@app.command(name="stage1-yolo-batch")
+def stage1_yolo_batch_command(
+    input_dir: Path = typer.Argument(..., help="输入目录"),
+    output_dir: Path = typer.Option("runs/stage1_yolo", "--output", "-o", help="输出目录"),
+    config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    confidence: Optional[float] = typer.Option(None, "--conf", min=0.0, max=1.0, help="YOLO置信度阈值覆盖"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
+):
+    """
+    批量仅执行 YOLO 检测（不进行 Stage1 后处理）。
+    """
+    log_level = "DEBUG" if verbose else "INFO"
+    setup_logger(level=log_level, log_file=output_dir / "stage1_yolo_batch.log")
+
+    config = load_merged_config(config_file)
+    if confidence is not None:
+        config.stage1.yolo.confidence_threshold = confidence
+
+    try:
+        outputs = run_stage1_yolo_only_batch(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            config=config.stage1,
+        )
+        console.print(f"[bold green]✓ YOLO-only batch processed {len(outputs)} images![/bold green]")
     except Exception as e:
         console.print(f"[bold red]✗ Error: {e}[/bold red]")
         sys.exit(1)

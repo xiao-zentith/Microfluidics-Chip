@@ -14,7 +14,7 @@ paths:
 # Stage1: 目标检测与几何校正
 stage1:
   yolo:
-    weights_path: "weights/yolo/best4.pt"  # YOLO detection weights path
+    weights_path: "weights/yolo/last.pt"  # YOLO detection weights path
     device: "cuda"
     confidence_threshold: 0.2
     class_id_blank: 0
