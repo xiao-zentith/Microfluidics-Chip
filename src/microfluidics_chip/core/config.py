@@ -96,6 +96,9 @@ class AdaptiveRuntimeConfig(BaseModel):
     max_reprojection_error: float = Field(default=35.0, ge=0.0, description="最大重投影误差（像素）")
     min_cluster_score: float = Field(default=0.20, ge=0.0, le=1.0, description="最小聚类质量得分")
     min_mean_confidence: float = Field(default=0.15, ge=0.0, le=1.0, description="最小平均置信度")
+    require_unique_blank: bool = Field(default=True, description="是否要求唯一 blank 锚点")
+    require_blank_outermost: bool = Field(default=True, description="是否要求 blank 位于臂最外侧")
+    min_arm_monotonicity: float = Field(default=0.75, ge=0.0, le=1.0, description="旋臂内->外距离单调性最小比例")
 
     # 重试调度
     confidence_decay: float = Field(default=0.85, gt=0.0, le=1.0, description="每次重试置信度衰减系数")

@@ -33,6 +33,14 @@ from ..stage1_detection.inference import infer_stage1, infer_stage1_adaptive, in
 
 logger = get_logger("pipelines.stage1")
 
+ARM_TEMPLATE_INDICES = (
+    (0, 1, 2),
+    (3, 4, 5),
+    (6, 7, 8),
+    (9, 10, 11),
+)
+OUTERMOST_TEMPLATE_INDICES = (2, 5, 8, 11)
+
 
 def _draw_yolo_detections(raw_image: np.ndarray, detections: List[ChamberDetection]) -> np.ndarray:
     """
@@ -65,6 +73,65 @@ def _draw_yolo_detections(raw_image: np.ndarray, detections: List[ChamberDetecti
         )
 
     return vis
+
+
+def _build_unique_assignment(
+    fitted_centers: np.ndarray,
+    source_centers: np.ndarray,
+    max_distance: float
+) -> Dict[int, int]:
+    """
+    基于距离的贪心一对一匹配，避免同一检测被重复映射到多个模板点。
+    """
+    if len(fitted_centers) == 0 or len(source_centers) == 0:
+        return {}
+
+    dmat = np.linalg.norm(
+        fitted_centers[:, None, :] - source_centers[None, :, :],
+        axis=2
+    )
+
+    candidate_pairs: List[Tuple[float, int, int]] = []
+    for fit_idx in range(dmat.shape[0]):
+        for src_idx in range(dmat.shape[1]):
+            dist = float(dmat[fit_idx, src_idx])
+            if dist <= max_distance:
+                candidate_pairs.append((dist, fit_idx, src_idx))
+
+    candidate_pairs.sort(key=lambda x: x[0])
+
+    assigned_fit = set()
+    assigned_src = set()
+    mapping: Dict[int, int] = {}
+
+    for _, fit_idx, src_idx in candidate_pairs:
+        if fit_idx in assigned_fit or src_idx in assigned_src:
+            continue
+        mapping[fit_idx] = src_idx
+        assigned_fit.add(fit_idx)
+        assigned_src.add(src_idx)
+
+    return mapping
+
+
+def _compute_arm_monotonicity(fitted_centers: np.ndarray) -> float:
+    """
+    计算四个旋臂是否满足“内->外距离单调递增”的比例。
+    """
+    if fitted_centers.shape[0] < 12:
+        return 0.0
+
+    centroid = np.mean(fitted_centers[:12], axis=0)
+    pass_count = 0
+    for arm in ARM_TEMPLATE_INDICES:
+        dists = [
+            float(np.linalg.norm(fitted_centers[idx] - centroid))
+            for idx in arm
+        ]
+        if dists[0] < dists[1] < dists[2]:
+            pass_count += 1
+
+    return pass_count / len(ARM_TEMPLATE_INDICES)
 
 
 def _resolve_runtime_config(
@@ -160,25 +227,31 @@ def _build_geometry_detections(
 
     fitted = fitted[:12]
     source_dets = adaptive_result.detections
-
-    source_centers = None
-    if source_dets:
-        source_centers = np.array([d.center for d in source_dets], dtype=np.float32)
+    source_centers = (
+        np.array([d.center for d in source_dets], dtype=np.float32)
+        if source_dets
+        else np.empty((0, 2), dtype=np.float32)
+    )
 
     patch_size = int(max(4, geometry_engine.config.crop_radius * 2))
     half = patch_size / 2.0
     detections: List[ChamberDetection] = []
 
-    for cx, cy in fitted:
-        if source_centers is not None:
-            d2 = np.sum((source_centers - np.array([cx, cy], dtype=np.float32)) ** 2, axis=1)
-            nearest_idx = int(np.argmin(d2))
-            nearest = source_dets[nearest_idx]
-            class_id = int(nearest.class_id)
+    # 一对一匹配半径：随几何步长自适应，避免把远处干扰点“硬拉”到模板点
+    match_radius = float(max(
+        geometry_engine.config.ideal_chamber_step * 1.6,
+        geometry_engine.config.crop_radius * 3
+    ))
+    match_map = _build_unique_assignment(fitted, source_centers, match_radius)
+
+    for fit_idx, (cx, cy) in enumerate(fitted):
+        class_id = int(class_id_lit)
+        confidence = 0.0
+
+        src_idx = match_map.get(fit_idx)
+        if src_idx is not None:
+            nearest = source_dets[src_idx]
             confidence = float(nearest.confidence)
-        else:
-            class_id = int(class_id_lit)
-            confidence = 0.0
 
         detections.append(
             ChamberDetection(
@@ -189,16 +262,36 @@ def _build_geometry_detections(
             )
         )
 
-    if force_blank_if_missing and detections:
-        has_blank = any(d.class_id == class_id_blank for d in detections)
-        if not has_blank:
-            first = detections[0]
-            detections[0] = ChamberDetection(
-                bbox=first.bbox,
-                center=first.center,
-                class_id=int(class_id_blank),
-                confidence=first.confidence
+    # blank 身份不再依赖 YOLO 类别，优先使用拓扑暗腔室索引
+    valid_dark = [
+        int(idx) for idx in adaptive_result.dark_chamber_indices
+        if 0 <= int(idx) < len(detections)
+    ]
+    blank_idx: Optional[int] = None
+
+    if valid_dark:
+        # 拓扑一般只给一个暗腔室，多个候选时优先使用最外侧索引
+        outer_dark = [idx for idx in valid_dark if idx in OUTERMOST_TEMPLATE_INDICES]
+        blank_idx = outer_dark[0] if outer_dark else valid_dark[0]
+    elif force_blank_if_missing and detections:
+        # 兜底：仅在最外侧四个位置里选置信度最低者，避免随机第一点
+        blank_idx = min(
+            OUTERMOST_TEMPLATE_INDICES,
+            key=lambda idx: detections[idx].confidence if idx < len(detections) else float("inf")
+        )
+
+    if blank_idx is not None and 0 <= blank_idx < len(detections):
+        normalized: List[ChamberDetection] = []
+        for idx, det in enumerate(detections):
+            normalized.append(
+                ChamberDetection(
+                    bbox=det.bbox,
+                    center=det.center,
+                    class_id=int(class_id_blank if idx == blank_idx else class_id_lit),
+                    confidence=det.confidence
+                )
             )
+        detections = normalized
 
     return detections
 
@@ -206,6 +299,7 @@ def _build_geometry_detections(
 def _collect_quality_metrics(
     adaptive_result: AdaptiveDetectionResult,
     geometry_detections: List[ChamberDetection],
+    class_id_blank: int,
     preprocess_mode: str,
     attempt_idx: int,
     attempt_config: AdaptiveDetectionConfig
@@ -213,8 +307,22 @@ def _collect_quality_metrics(
     """
     汇总质量闸门评估所需指标。
     """
-    confidences = [d.confidence for d in adaptive_result.detections]
-    mean_conf = float(np.mean(confidences)) if confidences else 0.0
+    confidences_raw = [d.confidence for d in adaptive_result.detections]
+    confidences_geo = [d.confidence for d in geometry_detections]
+    mean_conf_raw = float(np.mean(confidences_raw)) if confidences_raw else 0.0
+    mean_conf_geo = float(np.mean(confidences_geo)) if confidences_geo else 0.0
+
+    fitted = np.asarray(adaptive_result.fitted_centers, dtype=np.float32)
+    arm_monotonicity = _compute_arm_monotonicity(fitted) if fitted.ndim == 2 else 0.0
+
+    blank_indices = [
+        idx for idx, det in enumerate(geometry_detections)
+        if det.class_id == class_id_blank
+    ]
+    blank_count = len(blank_indices)
+    blank_on_outermost = (
+        blank_count == 1 and blank_indices[0] in OUTERMOST_TEMPLATE_INDICES
+    )
 
     metrics: Dict[str, Any] = {
         "attempt": attempt_idx + 1,
@@ -225,8 +333,13 @@ def _collect_quality_metrics(
         "reprojection_error": float(adaptive_result.reprojection_error),
         "cluster_score": float(adaptive_result.cluster_score),
         "is_fallback_cluster": bool(adaptive_result.is_fallback),
-        "mean_confidence": mean_conf,
+        "mean_confidence": mean_conf_geo,
+        "mean_confidence_raw": mean_conf_raw,
         "dark_chamber_count": len(adaptive_result.dark_chamber_indices),
+        "blank_count": blank_count,
+        "blank_indices": blank_indices,
+        "blank_on_outermost": bool(blank_on_outermost),
+        "arm_monotonicity": float(arm_monotonicity),
         "coarse_conf": float(attempt_config.coarse_conf),
         "fine_conf": float(attempt_config.fine_conf),
         "fine_imgsz": int(attempt_config.fine_imgsz),
@@ -242,14 +355,18 @@ def _quality_score(metrics: Dict[str, Any]) -> float:
     """
     detection_term = min(metrics["detection_count"] / 12.0, 1.0)
     reproj_term = 1.0 - min(metrics["reprojection_error"], 100.0) / 100.0
+    arm_term = float(metrics.get("arm_monotonicity", 0.0))
+    blank_term = 1.0 if bool(metrics.get("blank_on_outermost", False)) else 0.0
     fit_bonus = 0.15 if metrics["fit_success"] else -0.15
 
     return (
-        0.30 * metrics["inlier_ratio"]
-        + 0.22 * metrics["cluster_score"]
-        + 0.20 * metrics["mean_confidence"]
-        + 0.18 * detection_term
+        0.26 * metrics["inlier_ratio"]
+        + 0.20 * metrics["cluster_score"]
+        + 0.14 * metrics["mean_confidence"]
+        + 0.12 * detection_term
         + 0.10 * reproj_term
+        + 0.10 * arm_term
+        + 0.08 * blank_term
         + fit_bonus
     )
 
@@ -272,6 +389,12 @@ def _passes_quality_gate(
     if metrics["cluster_score"] < runtime_config.min_cluster_score:
         return False
     if metrics["mean_confidence"] < runtime_config.min_mean_confidence:
+        return False
+    if runtime_config.require_unique_blank and metrics.get("blank_count", 0) != 1:
+        return False
+    if runtime_config.require_blank_outermost and not metrics.get("blank_on_outermost", False):
+        return False
+    if metrics.get("arm_monotonicity", 0.0) < runtime_config.min_arm_monotonicity:
         return False
     return True
 
@@ -332,6 +455,7 @@ def _run_stage1_adaptive_with_retries(
             metrics = _collect_quality_metrics(
                 adaptive_result=adaptive_result,
                 geometry_detections=geometry_detections,
+                class_id_blank=config.yolo.class_id_blank,
                 preprocess_mode=preprocess_mode,
                 attempt_idx=attempt_idx,
                 attempt_config=attempt_config
@@ -345,6 +469,7 @@ def _run_stage1_adaptive_with_retries(
                 f"[{chip_id}] Adaptive attempt {attempt_idx + 1}/{max_attempts}: "
                 f"mode={preprocess_mode}, det={int(metrics['detection_count'])}, "
                 f"inlier={metrics['inlier_ratio']:.2f}, reproj={metrics['reprojection_error']:.2f}, "
+                f"blank_ok={metrics['blank_on_outermost']}, arm={metrics['arm_monotonicity']:.2f}, "
                 f"score={score:.3f}, pass={passed}"
             )
 

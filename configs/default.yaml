@@ -61,10 +61,13 @@ stage1:
     preprocess_sequence: ["raw", "clahe", "clahe_invert"]
     require_fit_success: true
     min_detections: 8
-    min_inlier_ratio: 0.4
+    min_inlier_ratio: 0.5
     max_reprojection_error: 35.0
     min_cluster_score: 0.2
     min_mean_confidence: 0.15
+    require_unique_blank: true
+    require_blank_outermost: true
+    min_arm_monotonicity: 0.75
     confidence_decay: 0.85
     min_coarse_conf: 0.03
     min_fine_conf: 0.12
