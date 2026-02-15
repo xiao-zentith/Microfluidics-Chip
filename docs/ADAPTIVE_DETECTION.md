@@ -1,6 +1,10 @@
 # Stage1 检测精度提升方案
 
 > **目标**: 确保在复杂光照、尺度变化条件下稳定检测 12 个腔室，并正确识别唯一的暗腔室
+>
+> **文档边界**: 本文档聚焦 Stage1 自适应检测与拓扑策略。完整 CLI 命令请以 `docs/CLI_REFERENCE.md` 为准：
+> - 命令入口：[`docs/CLI_REFERENCE.md`](./CLI_REFERENCE.md)
+> - 文档导航：[`docs/README.md`](./README.md)
 
 ---
 
@@ -166,7 +170,7 @@ Stage1 新增运行时质量控制，用于保护 Stage2 输入稳定性。
 
 ---
 
-## 🚀 完整使用流程
+## 🚀 最小闭环流程
 
 ```bash
 # Step 1: 标签迁移
@@ -185,25 +189,22 @@ python scripts/train_yolo.py --data yolo_v3_augmented --name chambers_v21 --no-v
 # 多卡模式（示例：GPU0,1；每卡 batch=8，总 batch=16）
 python scripts/train_yolo.py --data yolo_v3_augmented --name chambers_v21 --no-val --mode multi --gpus 0,1 --batch-per-gpu 8
 
-# Step 4: Stage1 自适应推理（单图）
+# Step 4: Stage1 自适应推理（单图，关注本专题）
 python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
   -o data/experiments/stage1 \
   --adaptive
 
-# Step 5: Stage1 自适应推理（批量）
+# Step 5: Stage1 自适应推理（批量，关注本专题）
 python -m microfluidics_chip.pipelines.cli stage1-batch \
   data/images \
   -o data/experiments/stage1_batch \
   --adaptive
-
-# Step 6: Stage2（仅接收通过 Stage1 的目录）
-python -m microfluidics_chip.pipelines.cli stage2 \
-  data/experiments/stage1/chip001 \
-  -o data/experiments/stage2
 ```
 
-`stage1_metadata.json` 将记录 `quality_metrics`、`quality_gate_passed`、`detection_mode`、`retry_attempt`。
+Stage2 与消融命令（`stage1-yolo` / `stage1-yolo-adaptive` / `stage1-post`）完整参数表请查看 `docs/CLI_REFERENCE.md`。
+
+`stage1_metadata.json` 中可重点关注：`quality_metrics`、`quality_gate_passed`、`detection_mode`、`retry_attempt`。
 
 ---
 

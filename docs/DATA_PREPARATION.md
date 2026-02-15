@@ -1,6 +1,10 @@
 # 数据集准备与训练指南
 
 > **目标**: 将原始拍摄图像转换为训练数据，并训练 Stage2 光照校正模型
+>
+> **文档边界**: 本文档聚焦数据与训练流程。CLI 全量命令请以 `docs/CLI_REFERENCE.md` 为准：
+> - 命令入口：[`docs/CLI_REFERENCE.md`](./CLI_REFERENCE.md)
+> - 文档导航：[`docs/README.md`](./README.md)
 
 ---
 
@@ -80,7 +84,7 @@ python scripts/rename_dataset.py dataset/chip001 --gt-image IMG_9999.jpg
 
 ---
 
-## � 第二步：Stage1 YOLO 数据集准备与训练
+## 🔍 第二步：Stage1 YOLO 数据集准备与训练
 
 ### YOLO 数据集标注格式
 
@@ -441,15 +445,16 @@ python scripts/evaluate_experiments.py \
 
 ### CLI 推理
 
-```bash
-# Stage1 + Stage2 完整流程
-python -m microfluidics_chip.pipelines.cli stage1 input.png -o output/
+为避免命令重复维护，本节不再重复完整 CLI 参数表。
 
-# 仅 Stage2 校正
-python -m microfluidics_chip.pipelines.cli stage2 \
-    input.png \
-    runs/my_training/weights/best_model.pth \
-    -o output/
+- Stage1/Stage2 最新命令与参数：[`docs/CLI_REFERENCE.md`](./CLI_REFERENCE.md)。
+- 实时命令定义：`python -m microfluidics_chip.pipelines.cli --help`
+
+最小示例：
+
+```bash
+python -m microfluidics_chip.pipelines.cli stage1 input.png -o data/experiments/stage1 --adaptive
+python -m microfluidics_chip.pipelines.cli stage2 data/experiments/stage1/input -o data/experiments/stage2
 ```
 
 ### Python API

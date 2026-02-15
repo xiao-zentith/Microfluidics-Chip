@@ -1,6 +1,11 @@
 # YOLO 检测精度提升指南
 
 > **目标**: 确保 YOLO 在所有图像上稳定检测到 12 个腔室，mAP@0.5 > 0.95
+>
+> **文档边界**:
+> - 本文档聚焦调参和优化思路，不作为 CLI 全量命令入口。
+> - CLI 命令请参考 [`docs/CLI_REFERENCE.md`](./CLI_REFERENCE.md)。
+> - 运行时真实定义请参考 `python -m microfluidics_chip.pipelines.cli --help`。
 
 ---
 

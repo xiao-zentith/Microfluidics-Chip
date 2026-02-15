@@ -2,6 +2,11 @@
 
 本文档总结项目中已实现的所有可视化功能。
 
+> 文档边界：
+> - 本文档只说明可视化产物与调试检查点。
+> - CLI 完整命令请看 [`docs/CLI_REFERENCE.md`](./CLI_REFERENCE.md)。
+> - 运行时真实定义请看 `python -m microfluidics_chip.pipelines.cli --help`。
+
 ---
 
 ## 📊 Stage1 可视化
@@ -15,13 +20,14 @@
 **可视化内容**:
 - 🔵 **蓝色圆点**: 腔室中心位置
 - 🟨 **黄色矩形框**: 切片区域边界（crop_radius）
-- 🔴 **红色圆圈 + "BLANK"**: 空白腔（锚点，class_id=0）
+- 🔴 **红色圆圈 + "BLANK"**: 后处理/拓扑判定后的 BLANK 位置（用于标记最终空白腔）
 
 **代码位置**: 
-- `src/microfluidics_chip/stage1_detection/geometry_engine.py:266-300`
+- `src/microfluidics_chip/stage1_detection/geometry_engine.py`
+- `src/microfluidics_chip/pipelines/stage1.py`
 
 **示例**:
-```python
+```bash
 # 自动生成（默认开启）
 python -m microfluidics_chip.pipelines.cli stage1 image.png -o runs/test --save-debug
 ```
@@ -244,6 +250,8 @@ python -m microfluidics_chip.pipelines.cli stage1 \
   --save-debug \
   --save-slices
 ```
+
+更多 Stage1 消融/后处理命令组合请参考 [`docs/CLI_REFERENCE.md`](./CLI_REFERENCE.md)。
 
 **检查顺序**:
 1. 查看 `debug_detection.png` → 确认12个腔室都被检测到

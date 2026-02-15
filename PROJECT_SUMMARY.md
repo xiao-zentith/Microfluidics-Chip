@@ -1,5 +1,8 @@
 # Microfluidics-Chip v1.1 - 项目总结
 
+> 说明：本文件是阶段性历史总结（快照），不作为当前命令与配置的权威来源。  
+> 最新命令请参考 `docs/CLI_REFERENCE.md`，实时定义请参考 `python -m microfluidics_chip.pipelines.cli --help`。
+
 ## 🎯 项目完成情况
 
 **v1.1 重构项目已 100% 完成！**

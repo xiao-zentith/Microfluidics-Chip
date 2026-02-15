@@ -1,5 +1,9 @@
 # 数据增强方法验证报告
 
+> 文档边界：
+> - 本文档为验证报告，不维护训练/推理命令全集。
+> - 命令入口请参考 [`docs/CLI_REFERENCE.md`](./CLI_REFERENCE.md) 与 [`docs/DATA_PREPARATION.md`](./DATA_PREPARATION.md)。
+
 ## ✅ 已完成：对齐原有synthesizer_chip.py
 
 ### 原有方法 (`deprecated/preprocess/synthesizer_chip.py`)

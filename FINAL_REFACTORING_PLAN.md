@@ -2,6 +2,9 @@
 
 > **项目目标**: 将Microfluidics-Chip项目重构为生产级、可维护、可复现、易部署的科研代码库  
 > **核心原则**: 职责单一、接口固化、CLI First、完整追溯、支持消融/对比实验
+>
+> 说明：本文件是重构设计文档（历史方案），示例命令可能与当前实现不完全一致。  
+> 最新命令请参考 `docs/CLI_REFERENCE.md`，实时定义请参考 `python -m microfluidics_chip.pipelines.cli --help`。
 
 ---
 

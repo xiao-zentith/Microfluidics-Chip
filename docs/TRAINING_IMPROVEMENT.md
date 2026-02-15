@@ -1,6 +1,10 @@
 # Stage2训练改进指南
 
 > **目标**: PSNR从13dB提升至30+dB
+>
+> **文档边界**:
+> - 本文档聚焦 Stage2 训练改进策略与实验建议。
+> - 数据准备与基线训练请看 [`docs/DATA_PREPARATION.md`](./DATA_PREPARATION.md)。
 
 ---
 

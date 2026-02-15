@@ -84,58 +84,22 @@ python -m microfluidics_chip.pipelines.cli stage2-batch \
 
 ## 📖 详细文档
 
-### CLI 命令
+- 文档导航与分工：[`docs/README.md`](docs/README.md)
+- CLI 命令参考（唯一文档）：[`docs/CLI_REFERENCE.md`](docs/CLI_REFERENCE.md)
+- 运行时真实定义：`python -m microfluidics_chip.pipelines.cli --help`
 
-#### Stage1 处理
+常用入口（完整参数组合见 `docs/CLI_REFERENCE.md`）：
 
 ```bash
-# 基本用法
-python -m microfluidics_chip.pipelines.cli stage1 IMAGE_PATH -o OUTPUT_DIR
+# Stage1 (自适应)
+python -m microfluidics_chip.pipelines.cli stage1 data/chip001.png -o data/experiments/stage1 --adaptive
 
-# 带 GT 图像
-python -m microfluidics_chip.pipelines.cli stage1 \
-  data/chip001.png \
-  --gt data/chip001_gt.png \
-  -o data/experiments/stage1
+# Stage2
+python -m microfluidics_chip.pipelines.cli stage2 data/experiments/stage1/chip001 -o data/experiments/stage2
 
-# 调试模式（保存检测可视化和单个切片）
-python -m microfluidics_chip.pipelines.cli stage1 \
-  data/chip001.png \
-  -o data/experiments/debug \
-  --save-slices \
-  --save-debug \
-  --adaptive
-
-# 使用自定义配置
-python -m microfluidics_chip.pipelines.cli stage1 \
-  data/chip001.png \
-  -o data/experiments/stage1 \
-  --config configs/my_config.yaml
-
-# 显式关闭自适应检测（走标准一次检测）
-python -m microfluidics_chip.pipelines.cli stage1 \
-  data/chip001.png \
-  -o data/experiments/stage1 \
-  --no-adaptive
-
-# 消融1：仅普通 YOLO（无后处理）
-python -m microfluidics_chip.pipelines.cli stage1-yolo \
-  data/chip001.png \
-  -o data/experiments/stage1_yolo
-
-# 消融2：仅两阶段 YOLO（粗到精 + ROI，仍无后处理）
-python -m microfluidics_chip.pipelines.cli stage1-yolo-adaptive \
-  data/chip001.png \
-  -o data/experiments/stage1_yolo_adaptive
-
-# 消融3：仅后处理（读取上一步的检测 JSON）
-python -m microfluidics_chip.pipelines.cli stage1-post \
-  data/experiments/stage1_yolo_adaptive/chip001/adaptive_yolo_raw_detections.json \
-  -o data/experiments/stage1_post
-
-# 后处理默认执行：拓扑拟合回填到固定12点 + 4末端亮度最小判定唯一BLANK
-# 可通过 --min-topology-detections 调整最小点数阈值（默认跟随配置 min_detections）
-# 拟合失败可用 --fallback-detection 触发宽松两阶段重检
+# 消融：两阶段YOLO -> 后处理
+python -m microfluidics_chip.pipelines.cli stage1-yolo-adaptive data/chip001.png -o data/experiments/stage1_yolo_adaptive
+python -m microfluidics_chip.pipelines.cli stage1-post data/experiments/stage1_yolo_adaptive/chip001/adaptive_yolo_raw_detections.json -o data/experiments/stage1_post
 ```
 
 启用 `--adaptive` 时，`stage1_metadata.json` 会额外包含：
@@ -143,20 +107,6 @@ python -m microfluidics_chip.pipelines.cli stage1-post \
 - `quality_gate_passed`
 - `detection_mode`
 - `retry_attempt`
-
-#### Stage2 处理
-
-```bash
-# 基本用法（P2 规范：只接受 stage1_run_dir）
-python -m microfluidics_chip.pipelines.cli stage2 \
-  data/experiments/stage1/chip001 \
-  -o data/experiments/stage2
-
-# 批量处理
-python -m microfluidics_chip.pipelines.cli stage2-batch \
-  data/experiments/stage1 \
-  -o data/experiments/stage2
-```
 
 ### Python API
 
@@ -253,235 +203,22 @@ Microfluidics-Chip/
 
 ---
 
-## 🔧 训练 UNet 模型
+## 🔧 训练与数据准备
 
-### 1. 准备训练数据
+完整训练流程已统一到专题文档，避免与 `docs/DATA_PREPARATION.md` 重复维护：
 
-#### 数据集结构
+- Stage1/Stage2 数据准备与训练：[`docs/DATA_PREPARATION.md`](docs/DATA_PREPARATION.md)
+- Stage1 自适应与拓扑后处理：[`docs/ADAPTIVE_DETECTION.md`](docs/ADAPTIVE_DETECTION.md)
+- Stage2 增强策略：[`docs/UNET_AUGMENTATION.md`](docs/UNET_AUGMENTATION.md)
 
-训练数据应按以下结构组织：
-
-```
-dataset/training/
-├── chip001/
-│   ├── gt.png          # 理想图（Ground Truth）- 干净无干扰
-│   ├── dirty_01.png    # 受干扰图1（距离/光照/角度变化）
-│   ├── dirty_02.png    # 受干扰图2
-│   ├── dirty_03.png    # 受干扰图3
-│   └── ...             # 更多干扰图
-├── chip002/
-│   ├── gt.png
-│   ├── dirty_01.png
-│   └── ...
-└── chip003/
-    └── ...
-```
-
-**说明**：
-- 每个芯片一个目录
-- `gt.png`（或`GT.png`）: 理想图，作为校正目标
-- `dirty_*.png`（或`noisy_*.png`）: 受干扰图，每个会生成多条训练数据
-- 支持格式：`.png`, `.jpg`, `.jpeg`
-
-#### 数据准备策略
-
-项目支持三种数据准备方式，可根据实际情况选择：
-
-| 策略 | 适用场景 | 数据质量 | 数据量 | 脚本 |
-|------|----------|----------|--------|------|
-| **真实数据** | 有实际采集数据 | 高（真实场景） | 中 | `prepare_training_data.py` |
-| **合成数据** | 真实数据不足 | 中（可控性强） | 大（可无限生成） | `FullChipSynthesizer` |
-| **混合数据** | 生产环境（推荐） | 高 | 大 | `prepare_mixed_dataset.py` |
-
----
-
-#### 方式1：真实数据（1GT + 多Dirty）
-
-处理实际采集的数据，每个芯片包含1张GT和多张干扰图。
+最小训练闭环（示例）：
 
 ```bash
-# 数据结构
-dataset/real_training/
-├── chip001/
-│   ├── gt.png
-│   ├── dirty_01.png
-│   ├── dirty_02.png
-│   └── dirty_03.png
-└── chip002/
-    └── ...
+# 1) 准备 Stage2 训练数据
+python scripts/prepare_training_data.py dataset/training -o data/training.npz
 
-# 生成训练数据
-python scripts/prepare_training_data.py \
-  dataset/real_training \
-  -o data/real_training.npz
-```
-
-**特点**：
-- ✅ 真实场景数据，泛化能力强
-- ✅ 包含真实的噪声和干扰模式
-- ⚠️ 需要实际采集，数据量有限
-
----
-
-#### 方式2：合成数据（1GT × 倍率）
-
-从理想GT图像合成大量训练数据。
-
-```bash
-# 数据结构
-dataset/clean_images/
-├── chip001_clean.png
-├── chip002_clean.png
-└── ...
-
-# 使用Synthesizer生成
-python -c "
-from pathlib import Path
-from microfluidics_chip.core.config import get_default_config
-from microfluidics_chip.stage1_detection.detector import ChamberDetector
-from microfluidics_chip.stage1_detection.synthesizer import FullChipSynthesizer
-import numpy as np
-
-config = get_default_config()
-detector = ChamberDetector(config.stage1.yolo)
-synth = FullChipSynthesizer(detector, config.stage1.geometry)
-
-# 运行合成（倍率=50）
-synth.run(
-    clean_dir=Path('dataset/clean_images'),
-    output_path=Path('data/synthetic_training.npz'),
-    multiplier=50
-)
-"
-```
-
-**特点**：
-- ✅ 可大量生成，数据量充足
-- ✅ 可控的干扰参数
-- ⚠️ 模拟数据，可能与真实场景有差异
-
----
-
-#### 方式3：混合数据（推荐）⭐
-
-结合真实数据和合成数据，平衡质量与数量。
-
-```bash
-# 生成混合数据集
-python scripts/prepare_mixed_dataset.py \
-  --real dataset/real_training \
-  --synthetic dataset/clean_images \
-  -o data/mixed_training.npz \
-  --synthetic-multiplier 50
-
-# 仅使用真实数据
-python scripts/prepare_mixed_dataset.py \
-  --real dataset/real_training \
-  -o data/real_only.npz
-
-# 仅使用合成数据
-python scripts/prepare_mixed_dataset.py \
-  --synthetic dataset/clean_images \
-  -o data/synthetic_only.npz \
-  --synthetic-multiplier 100
-```
-
-**输出示例**：
-```
-Dataset Composition:
-  - Real data:      270 samples (10%)
-  - Synthetic data: 2430 samples (90%)
-  - Total:          2700 samples
-```
-
-**推荐配置**：
-- 小规模：10芯片真实数据 + 5张GT×50倍 ≈ 3000样本
-- 中规模：50芯片真实数据 + 20张GT×50倍 ≈ 12000样本
-- 大规模：100芯片真实数据 + 50张GT×100倍 ≈ 60000样本
-
----
-
-#### 数据准备流程
-
-Stage1 会对每个芯片执行以下处理：
-
-1. **检测腔室**: GT图 + 每个Dirty图 → YOLO检测 → 12个腔室位置
-2. **几何校正**: 基于检测位置进行变换对齐
-3. **切片提取**: 提取12个腔室切片
-4. **配对**: 每个Dirty腔室 ↔ 对应GT腔室
-5. **基准提取**: 提取3个基准腔室(索引0-2)用于UNet双流输入
-
-**处理命令**：
-
-```bash
-# 准备训练数据
-python scripts/prepare_training_data.py \
-  dataset/training \
-  -o data/training.npz
-
-# 使用自定义配置
-python scripts/prepare_training_data.py \
-  dataset/training \
-  -o data/training.npz \
-  --config configs/my_config.yaml
-
-# 不保存调试图像
-python scripts/prepare_training_data.py \
-  dataset/training \
-  -o data/training.npz \
-  --no-debug
-```
-
-**输出**：
-```
-data/training.npz
-├── signals    # (N, H, W, 3) 干扰腔室切片
-├── references # (N, 3, H, W, 3) 3个基准腔室切片
-└── targets    # (N, H, W, 3) 理想腔室切片（GT）
-```
-
-**调试输出** (在每个芯片目录):
-```
-dataset/training/chip001/
-├── debug_gt.png           # GT检测可视化
-├── debug_dirty_01.png     # Dirty_01检测可视化
-└── ...
-```
-
-**数据集统计示例**:
-```
-Dataset Statistics:
-  - Total chips: 10
-  - Total samples: 810
-  - Avg samples/chip: 81.0
-```
-
-**说明**: 
-- 每个Dirty图 × 每个腔室(9个，跳过3个基准) = 9条样本
-- 3个Dirty图 × 9个腔室 = 27条样本/芯片
-- 10个芯片 × 27 = 270条样本（最小示例）
-
----
-
-### 2. 训练模型
-
-```bash
-# 训练 Stage2 UNet
-python scripts/train_stage2.py \
-  data/synthetic_data.npz \
-  -o runs/training \
-  --epochs 100 \
-  --batch-size 32 \
-  --lr 1e-4
-
-# 使用自定义参数
-python scripts/train_stage2.py \
-  data/synthetic_data.npz \
-  -o runs/training \
-  --epochs 200 \
-  --roi-radius 20 \
-  --lambda-cos 0.2 \
-  --device cuda
+# 2) 训练 Stage2
+python scripts/train_stage2.py data/training.npz -o runs/training --epochs 100
 ```
 
 ---
