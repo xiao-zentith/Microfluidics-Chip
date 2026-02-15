@@ -49,6 +49,21 @@ console = Console()
 
 # ==================== 配置加载辅助函数 ====================
 
+def _resolve_default_yaml_path() -> Optional[Path]:
+    """
+    解析默认配置文件路径，优先仓库内 `configs/default.yaml`。
+    """
+    candidates = [
+        Path.cwd() / "configs" / "default.yaml",
+        Path(__file__).resolve().parents[3] / "configs" / "default.yaml",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
 def load_merged_config(config_path: Optional[Path]) -> MicrofluidicsConfig:
     """
     加载并合并配置
@@ -58,8 +73,12 @@ def load_merged_config(config_path: Optional[Path]) -> MicrofluidicsConfig:
     :param config_path: 用户指定的配置文件路径
     :return: 合并后的配置
     """
-    # 1. 加载默认配置
-    default_config = get_default_config()
+    # 1. 优先加载 configs/default.yaml，找不到时回退内置默认配置
+    default_yaml = _resolve_default_yaml_path()
+    if default_yaml is not None:
+        default_config = load_config_from_yaml(default_yaml)
+    else:
+        default_config = get_default_config()
     
     # 2. 如果用户提供了配置文件，合并
     if config_path and config_path.exists():
