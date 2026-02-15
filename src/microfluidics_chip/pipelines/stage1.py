@@ -38,6 +38,7 @@ from ..stage1_detection.topology_fitter import (
 )
 from ..stage1_detection.preprocess import preprocess_image
 from ..stage1_detection.inference import infer_stage1, infer_stage1_adaptive, infer_stage1_from_detections
+from ..stage1_detection.topology_debug import debug_dump_topology
 
 logger = get_logger("pipelines.stage1")
 
@@ -48,6 +49,16 @@ ARM_TEMPLATE_INDICES = (
     (9, 10, 11),
 )
 OUTERMOST_TEMPLATE_INDICES = (2, 5, 8, 11)
+
+
+class TopologyPostprocessError(RuntimeError):
+    """
+    后处理阶段异常，携带可落盘的 debug payload。
+    """
+    def __init__(self, message: str, debug_payload: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.message = message
+        self.debug_payload = debug_payload or {}
 
 
 def _draw_yolo_detections(raw_image: np.ndarray, detections: List[ChamberDetection]) -> np.ndarray:
@@ -277,19 +288,62 @@ def _run_topology_refine_postprocess(
     config: Stage1Config,
     min_topology_detections: int,
     source_tag: str,
+    raw_image_path: Path,
+    attempt_id: str,
+    used_fallback: bool,
+    roi_bbox: Optional[Any] = None,
+    detection_params: Optional[Dict[str, Any]] = None,
     geometry_engine: Optional[CrossGeometryEngine] = None
-) -> Tuple[List[ChamberDetection], Dict[str, Any]]:
+) -> Tuple[List[ChamberDetection], Dict[str, Any], Dict[str, Any]]:
     """
     对检测点执行拓扑拟合回填，输出固定12点几何检测及 QC。
     """
     n_det = len(source_detections)
+    topology_cfg = _build_internal_topology_config(config)
+    fill_match_thresh_px = float(max(15.0, config.geometry.crop_radius * 0.6))
+
     if n_det < min_topology_detections:
-        raise RuntimeError(
-            f"postprocess_qc_failed: insufficient_detections_for_topology "
+        reason = (
+            "postprocess_qc_failed: insufficient_detections_for_topology "
             f"(n_det={n_det}, min_required={min_topology_detections})"
         )
+        debug_payload = _build_topology_attempt_debug_payload(
+            chip_id=chip_id,
+            attempt_id=attempt_id,
+            status="failed",
+            raw_image_path=raw_image_path,
+            source_tag=source_tag,
+            used_fallback=used_fallback,
+            min_topology_detections=min_topology_detections,
+            source_detections=source_detections,
+            topology_cfg=topology_cfg,
+            fit_success=False,
+            transform_type="none",
+            n_inliers=0,
+            rmse_px=None,
+            scale=None,
+            rotation_deg=None,
+            coverage_arms=0.0,
+            inlier_indices=[],
+            fitted_centers=None,
+            visibility=None,
+            detected_mask=None,
+            blank_scores={},
+            blank_indices=[],
+            blank_confidence=0.0,
+            fill_match_thresh_px=fill_match_thresh_px,
+            roi_bbox=roi_bbox,
+            failure_reason=reason,
+            detection_params=detection_params,
+            qc={
+                "source": source_tag,
+                "n_det": int(n_det),
+                "fit_success": False,
+                "fit_success_raw": False,
+            },
+        )
+        raise TopologyPostprocessError(reason, debug_payload=debug_payload)
 
-    topology_cfg = _build_internal_topology_config(config)
     fitter = TopologyFitter(topology_cfg)
 
     detected_centers = np.array([d.center for d in source_detections], dtype=np.float32)
@@ -326,6 +380,7 @@ def _run_topology_refine_postprocess(
         "coverage_arms": float(coverage_arms),
         "scale": float(scale),
         "rotation": float(rotation_deg),
+        "transform_type": str(fitting_result.transform_type),
         "blank_scores": {str(k): float(v) for k, v in blank_scores.items()},
         "blank_confidence": float(blank_confidence),
         "blank_indices": [int(x) for x in blank_indices],
@@ -333,16 +388,53 @@ def _run_topology_refine_postprocess(
         "fit_success": bool(fit_success_qc),
     }
 
+    debug_payload = _build_topology_attempt_debug_payload(
+        chip_id=chip_id,
+        attempt_id=attempt_id,
+        status="success",
+        raw_image_path=raw_image_path,
+        source_tag=source_tag,
+        used_fallback=used_fallback,
+        min_topology_detections=min_topology_detections,
+        source_detections=source_detections,
+        topology_cfg=topology_cfg,
+        fit_success=fit_success_qc,
+        transform_type=str(fitting_result.transform_type),
+        n_inliers=n_inliers,
+        rmse_px=rmse_px,
+        scale=scale,
+        rotation_deg=rotation_deg,
+        coverage_arms=coverage_arms,
+        inlier_indices=[int(i) for i in fitting_result.inlier_indices],
+        fitted_centers=np.asarray(fitting_result.fitted_centers, dtype=np.float32),
+        visibility=np.asarray(fitting_result.visibility, dtype=bool),
+        detected_mask=np.asarray(fitting_result.detected_mask, dtype=bool),
+        blank_scores=blank_scores,
+        blank_indices=blank_indices,
+        blank_confidence=blank_confidence,
+        fill_match_thresh_px=fill_match_thresh_px,
+        roi_bbox=roi_bbox,
+        failure_reason=None,
+        detection_params=detection_params,
+        qc=qc,
+    )
+
     if not fit_success_qc:
-        raise RuntimeError(
+        reason = (
             "postprocess_qc_failed: topology_fit_failed "
             f"(n_det={n_det}, n_inliers={n_inliers}, rmse_px={rmse_px:.2f}, coverage_arms={coverage_arms:.2f})"
         )
+        debug_payload["status"] = "failed"
+        debug_payload["failure_reason"] = reason
+        raise TopologyPostprocessError(reason, debug_payload=debug_payload)
     if not blank_indices:
-        raise RuntimeError(
+        reason = (
             "postprocess_qc_failed: blank_unresolved "
             f"(n_det={n_det}, coverage_arms={coverage_arms:.2f})"
         )
+        debug_payload["status"] = "failed"
+        debug_payload["failure_reason"] = reason
+        raise TopologyPostprocessError(reason, debug_payload=debug_payload)
 
     adaptive_result = AdaptiveDetectionResult(
         detections=source_detections,
@@ -367,7 +459,7 @@ def _run_topology_refine_postprocess(
         class_id_lit=config.yolo.class_id_lit,
         force_blank_if_missing=False
     )
-    return geometry_detections, qc
+    return geometry_detections, qc, debug_payload
 
 
 def _load_detection_payload(detections_json_path: Path) -> Dict[str, Any]:
@@ -472,6 +564,193 @@ def _build_unique_assignment(
         assigned_src.add(src_idx)
 
     return mapping
+
+
+def _serialize_detections_for_debug(detections: List[ChamberDetection]) -> List[Dict[str, Any]]:
+    payload: List[Dict[str, Any]] = []
+    for idx, det in enumerate(detections):
+        payload.append(
+            {
+                "det_idx": int(idx),
+                "x": float(det.center[0]),
+                "y": float(det.center[1]),
+                "conf": float(det.confidence),
+                "class_id": int(det.class_id),
+                "bbox": [int(det.bbox[0]), int(det.bbox[1]), int(det.bbox[2]), int(det.bbox[3])],
+            }
+        )
+    return payload
+
+
+def _normalize_roi_bbox(roi_bbox: Optional[Any]) -> Optional[List[int]]:
+    if roi_bbox is None:
+        return None
+    if not isinstance(roi_bbox, (list, tuple)) or len(roi_bbox) != 4:
+        return None
+    try:
+        return [int(roi_bbox[0]), int(roi_bbox[1]), int(roi_bbox[2]), int(roi_bbox[3])]
+    except Exception:
+        return None
+
+
+def _build_fitted_point_debug(
+    fitted_centers: np.ndarray,
+    source_detections: List[ChamberDetection],
+    visibility: Optional[np.ndarray],
+    detected_mask: Optional[np.ndarray],
+    fill_match_thresh_px: float
+) -> Dict[str, Any]:
+    src_centers = (
+        np.array([d.center for d in source_detections], dtype=np.float32)
+        if source_detections
+        else np.empty((0, 2), dtype=np.float32)
+    )
+
+    fitted_points: List[Dict[str, Any]] = []
+    pure_filled_count = 0
+
+    for idx in range(int(fitted_centers.shape[0])):
+        cx = float(fitted_centers[idx, 0])
+        cy = float(fitted_centers[idx, 1])
+
+        if src_centers.shape[0] > 0:
+            dists = np.linalg.norm(src_centers - np.array([cx, cy], dtype=np.float32), axis=1)
+            matched_det_idx = int(np.argmin(dists))
+            match_dist = float(np.min(dists))
+        else:
+            matched_det_idx = None
+            match_dist = None
+
+        pure_filled = bool(match_dist is None or match_dist > fill_match_thresh_px)
+        if pure_filled:
+            pure_filled_count += 1
+
+        fitted_points.append(
+            {
+                "template_index": int(idx),
+                "x": cx,
+                "y": cy,
+                "visibility": bool(visibility[idx]) if visibility is not None and idx < len(visibility) else None,
+                "detected_by_model": bool(detected_mask[idx]) if detected_mask is not None and idx < len(detected_mask) else None,
+                "matched_det_idx": matched_det_idx,
+                "match_dist_px": match_dist,
+                "pure_filled": pure_filled,
+            }
+        )
+
+    ratio = float(pure_filled_count / max(1, len(fitted_points)))
+    return {
+        "fitted_points": fitted_points,
+        "pure_filled_count": int(pure_filled_count),
+        "pure_filled_ratio": ratio,
+    }
+
+
+def _build_topology_attempt_debug_payload(
+    *,
+    chip_id: str,
+    attempt_id: str,
+    status: str,
+    raw_image_path: Path,
+    source_tag: str,
+    used_fallback: bool,
+    min_topology_detections: int,
+    source_detections: List[ChamberDetection],
+    topology_cfg: InternalTopologyConfig,
+    fit_success: bool = False,
+    transform_type: str = "none",
+    n_inliers: int = 0,
+    rmse_px: Optional[float] = None,
+    scale: Optional[float] = None,
+    rotation_deg: Optional[float] = None,
+    coverage_arms: Optional[float] = None,
+    inlier_indices: Optional[List[int]] = None,
+    fitted_centers: Optional[np.ndarray] = None,
+    visibility: Optional[np.ndarray] = None,
+    detected_mask: Optional[np.ndarray] = None,
+    blank_scores: Optional[Dict[int, float]] = None,
+    blank_indices: Optional[List[int]] = None,
+    blank_confidence: Optional[float] = None,
+    fill_match_thresh_px: float = 15.0,
+    roi_bbox: Optional[Any] = None,
+    failure_reason: Optional[str] = None,
+    detection_params: Optional[Dict[str, Any]] = None,
+    qc: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    detections_payload = _serialize_detections_for_debug(source_detections)
+
+    fit_block: Dict[str, Any] = {
+        "fit_success": bool(fit_success),
+        "transform_type": str(transform_type),
+        "n_inliers": int(n_inliers),
+        "rmse_px": float(rmse_px) if rmse_px is not None and np.isfinite(rmse_px) else None,
+        "scale": float(scale) if scale is not None and np.isfinite(scale) else None,
+        "rotation_deg": float(rotation_deg) if rotation_deg is not None and np.isfinite(rotation_deg) else None,
+        "coverage_arms": float(coverage_arms) if coverage_arms is not None and np.isfinite(coverage_arms) else None,
+        "fill_match_thresh_px": float(fill_match_thresh_px),
+    }
+
+    template_name = (
+        Path(topology_cfg.template_path).name
+        if topology_cfg.template_path
+        else "default_cross_template"
+    )
+    template_block = {
+        "template_name": template_name,
+        "template_version": "cross12_v1",
+        "template_scale": float(topology_cfg.template_scale),
+        "template_path": topology_cfg.template_path,
+    }
+
+    fitted_block = {
+        "fitted_points": [],
+        "pure_filled_count": 0,
+        "pure_filled_ratio": 0.0,
+    }
+    if fitted_centers is not None and isinstance(fitted_centers, np.ndarray) and fitted_centers.ndim == 2:
+        fitted_block = _build_fitted_point_debug(
+            fitted_centers=fitted_centers,
+            source_detections=source_detections,
+            visibility=visibility,
+            detected_mask=detected_mask,
+            fill_match_thresh_px=fill_match_thresh_px
+        )
+
+    blank_scores_dict = {str(int(k)): float(v) for k, v in (blank_scores or {}).items()}
+    blank_indices = [int(i) for i in (blank_indices or [])]
+    blank_id = int(blank_indices[0]) if blank_indices else None
+
+    return {
+        "chip_id": chip_id,
+        "attempt_id": attempt_id,
+        "status": status,
+        "failure_reason": failure_reason,
+        "raw_image_path": str(raw_image_path),
+        "coordinate_frame": "raw_image",
+        "roi_bbox": _normalize_roi_bbox(roi_bbox),
+        "used_fallback": bool(used_fallback),
+        "source": source_tag,
+        "input": {
+            "min_topology_detections": int(min_topology_detections),
+            "detection_params": detection_params or {},
+        },
+        "n_det": int(len(source_detections)),
+        "detections": detections_payload,
+        "inlier_det_indices": [int(i) for i in (inlier_indices or [])],
+        "fit": fit_block,
+        "template": template_block,
+        "fitted_points": fitted_block["fitted_points"],
+        "pure_filled_count": int(fitted_block["pure_filled_count"]),
+        "pure_filled_ratio": float(fitted_block["pure_filled_ratio"]),
+        "blank": {
+            "candidate_indices": [int(i) for i in OUTERMOST_TEMPLATE_INDICES],
+            "blank_scores": blank_scores_dict,
+            "blank_id": blank_id,
+            "blank_confidence": float(blank_confidence) if blank_confidence is not None else None,
+            "score_method": "0.7*p10(V)+0.3*median(V), circle_roi",
+        },
+        "qc": qc or {},
+    }
 
 
 def _compute_arm_monotonicity(fitted_centers: np.ndarray) -> float:
@@ -1264,6 +1543,8 @@ def run_stage1_postprocess_from_json(
     )
 
     final_chip_id = chip_id or payload.get("chip_id") or resolved_raw_image.stem
+    run_dir = Path(output_dir) / final_chip_id
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     raw_image = cv2.imread(str(resolved_raw_image))
     if raw_image is None:
@@ -1278,24 +1559,73 @@ def run_stage1_postprocess_from_json(
     )
     min_required = max(2, min(12, min_required))
 
-    selected_detections = detections_from_json
+    attempts: List[Dict[str, Any]] = []
+    selected_attempt_payload: Optional[Dict[str, Any]] = None
+    selected_geometry_detections: Optional[List[ChamberDetection]] = None
+    selected_qc: Dict[str, Any] = {}
     selected_source = "json"
-    qc: Dict[str, Any] = {}
 
+    json_detection_params: Dict[str, Any] = {
+        "source_json": str(detections_json_path),
+        "adaptive_config_from_json": payload.get("adaptive_config"),
+        "preprocess_mode": "from_json",
+    }
+    json_roi_bbox = payload.get("roi_bbox")
+
+    # ---------- Try 1: detections from JSON ----------
     try:
-        geometry_detections, qc = _run_topology_refine_postprocess(
+        geometry_detections, qc, attempt_payload = _run_topology_refine_postprocess(
             chip_id=final_chip_id,
             raw_image=raw_image,
-            source_detections=selected_detections,
+            source_detections=detections_from_json,
             config=config,
             min_topology_detections=min_required,
-            source_tag=selected_source,
+            source_tag="json",
+            raw_image_path=resolved_raw_image,
+            attempt_id="try1_json",
+            used_fallback=False,
+            roi_bbox=json_roi_bbox,
+            detection_params=json_detection_params,
             geometry_engine=effective_geometry_engine
         )
-    except Exception as first_err:
+        debug_dump_topology(run_dir, raw_image, attempt_payload, suffix="_try1")
+        attempts.append(attempt_payload)
+        selected_attempt_payload = attempt_payload
+        selected_geometry_detections = geometry_detections
+        selected_qc = qc
+    except TopologyPostprocessError as first_err:
+        first_payload = first_err.debug_payload or _build_topology_attempt_debug_payload(
+            chip_id=final_chip_id,
+            attempt_id="try1_json",
+            status="failed",
+            raw_image_path=resolved_raw_image,
+            source_tag="json",
+            used_fallback=False,
+            min_topology_detections=min_required,
+            source_detections=detections_from_json,
+            topology_cfg=_build_internal_topology_config(config),
+            failure_reason=str(first_err),
+            detection_params=json_detection_params,
+            roi_bbox=json_roi_bbox,
+            fit_success=False,
+            transform_type="none",
+            n_inliers=0,
+            qc={"source": "json", "n_det": len(detections_from_json), "fit_success": False},
+        )
+        debug_dump_topology(run_dir, raw_image, first_payload, suffix="_try1")
+        attempts.append(first_payload)
+
         if not enable_fallback_detection:
+            final_payload = dict(first_payload)
+            final_payload["used_fallback"] = False
+            final_payload["final_status"] = "failed"
+            final_payload["final_reason"] = str(first_err)
+            final_payload["attempts"] = attempts
+            final_payload["selected_attempt_id"] = "try1_json"
+            debug_dump_topology(run_dir, raw_image, final_payload, suffix=None)
             raise RuntimeError(str(first_err)) from first_err
 
+        # ---------- Try 2: relaxed fallback adaptive detection ----------
         logger.warning(
             f"[{final_chip_id}] postprocess topology refine failed from json detections: {first_err}. "
             "Retrying with relaxed adaptive detection."
@@ -1312,6 +1642,7 @@ def run_stage1_postprocess_from_json(
                 detector = ChamberDetector(cpu_yolo_cfg)
             else:
                 raise
+
         relaxed_cfg = _build_relaxed_post_adaptive_config(config)
         adaptive_detector = AdaptiveDetector(
             InternalAdaptiveDetectionConfig(
@@ -1328,53 +1659,115 @@ def run_stage1_postprocess_from_json(
             ),
             detector
         )
-        fallback_detections, _ = adaptive_detector.detect_adaptive(raw_image)
-        selected_detections = fallback_detections
-        selected_source = "fallback_adaptive"
+        fallback_detections, fallback_cluster = adaptive_detector.detect_adaptive(raw_image)
+        fallback_detection_params = {
+            "preprocess_mode": "fallback_adaptive",
+            "coarse_conf": float(relaxed_cfg.coarse_conf),
+            "fine_conf": float(relaxed_cfg.fine_conf),
+            "fine_imgsz": int(relaxed_cfg.fine_imgsz),
+            "enable_clahe": bool(relaxed_cfg.enable_clahe),
+            "clahe_clip_limit": float(relaxed_cfg.clahe_clip_limit),
+        }
 
-        geometry_detections, qc = _run_topology_refine_postprocess(
-            chip_id=final_chip_id,
-            raw_image=raw_image,
-            source_detections=selected_detections,
-            config=config,
-            min_topology_detections=min_required,
-            source_tag=selected_source,
-            geometry_engine=effective_geometry_engine
-        )
-        qc["fallback_reason"] = str(first_err)
+        try:
+            geometry_detections, qc, second_payload = _run_topology_refine_postprocess(
+                chip_id=final_chip_id,
+                raw_image=raw_image,
+                source_detections=fallback_detections,
+                config=config,
+                min_topology_detections=min_required,
+                source_tag="fallback_adaptive",
+                raw_image_path=resolved_raw_image,
+                attempt_id="try2_fallback",
+                used_fallback=True,
+                roi_bbox=fallback_cluster.roi_bbox,
+                detection_params=fallback_detection_params,
+                geometry_engine=effective_geometry_engine
+            )
+            second_payload["fallback_reason"] = str(first_err)
+            debug_dump_topology(run_dir, raw_image, second_payload, suffix="_try2")
+            attempts.append(second_payload)
 
-    qc.update(
+            selected_attempt_payload = second_payload
+            selected_geometry_detections = geometry_detections
+            selected_qc = qc
+            selected_source = "fallback_adaptive"
+        except TopologyPostprocessError as second_err:
+            second_payload = second_err.debug_payload or _build_topology_attempt_debug_payload(
+                chip_id=final_chip_id,
+                attempt_id="try2_fallback",
+                status="failed",
+                raw_image_path=resolved_raw_image,
+                source_tag="fallback_adaptive",
+                used_fallback=True,
+                min_topology_detections=min_required,
+                source_detections=fallback_detections,
+                topology_cfg=_build_internal_topology_config(config),
+                failure_reason=str(second_err),
+                detection_params=fallback_detection_params,
+                roi_bbox=fallback_cluster.roi_bbox,
+                fit_success=False,
+                transform_type="none",
+                n_inliers=0,
+                qc={"source": "fallback_adaptive", "n_det": len(fallback_detections), "fit_success": False},
+            )
+            second_payload["fallback_reason"] = str(first_err)
+            debug_dump_topology(run_dir, raw_image, second_payload, suffix="_try2")
+            attempts.append(second_payload)
+
+            final_payload = dict(second_payload)
+            final_payload["used_fallback"] = True
+            final_payload["final_status"] = "failed"
+            final_payload["final_reason"] = str(second_err)
+            final_payload["attempts"] = attempts
+            final_payload["selected_attempt_id"] = "try2_fallback"
+            debug_dump_topology(run_dir, raw_image, final_payload, suffix=None)
+            raise RuntimeError(str(second_err)) from second_err
+
+    if selected_geometry_detections is None or selected_attempt_payload is None:
+        raise RuntimeError(f"[{final_chip_id}] unexpected empty postprocess output")
+
+    selected_qc.update(
         {
             "source_detections_json": str(detections_json_path),
             "input_detection_count": int(len(detections_from_json)),
-            "selected_detection_count": int(len(selected_detections)),
+            "selected_detection_count": int(len(selected_geometry_detections)),
             "min_topology_detections": int(min_required),
         }
     )
+    if selected_source != "json":
+        selected_qc["fallback_reason"] = attempts[0].get("failure_reason") if attempts else None
 
     logger.info(
-        f"[{final_chip_id}] postprocess QC: source={qc.get('source')}, "
-        f"n_det={qc.get('n_det')}, n_inliers={qc.get('n_inliers')}, rmse_px={qc.get('rmse_px'):.2f}, "
-        f"coverage_arms={qc.get('coverage_arms'):.2f}, scale={qc.get('scale'):.3f}, "
-        f"rotation={qc.get('rotation'):.2f}, blank_scores={qc.get('blank_scores')}, "
-        f"blank_confidence={qc.get('blank_confidence'):.3f}"
+        f"[{final_chip_id}] postprocess QC: source={selected_qc.get('source')}, "
+        f"n_det={selected_qc.get('n_det')}, n_inliers={selected_qc.get('n_inliers')}, rmse_px={selected_qc.get('rmse_px'):.2f}, "
+        f"coverage_arms={selected_qc.get('coverage_arms'):.2f}, scale={selected_qc.get('scale'):.3f}, "
+        f"rotation={selected_qc.get('rotation'):.2f}, blank_scores={selected_qc.get('blank_scores')}, "
+        f"blank_confidence={selected_qc.get('blank_confidence'):.3f}"
     )
+
+    # Final merged debug (required fixed filename)
+    final_debug_payload = dict(selected_attempt_payload)
+    final_debug_payload["attempts"] = attempts
+    final_debug_payload["used_fallback"] = (selected_source != "json")
+    final_debug_payload["selected_attempt_id"] = selected_attempt_payload.get("attempt_id")
+    final_debug_payload["final_status"] = "success"
+    final_debug_payload["final_reason"] = None
+    final_debug_payload["qc"] = selected_qc
+    debug_dump_topology(run_dir, raw_image, final_debug_payload, suffix=None)
 
     result = infer_stage1_from_detections(
         chip_id=final_chip_id,
         raw_image=raw_image,
         gt_image=None,
-        detections_raw=geometry_detections,
+        detections_raw=selected_geometry_detections,
         config=config,
         geometry_engine=effective_geometry_engine,
-        quality_metrics=qc,
-        quality_gate_passed=bool(qc.get("fit_success", False)),
+        quality_metrics=selected_qc,
+        quality_gate_passed=bool(selected_qc.get("fit_success", False)),
         detection_mode="postprocess_topology_refined",
         retry_attempt=1 if selected_source != "json" else 0
     )
-
-    run_dir = Path(output_dir) / final_chip_id
-    run_dir.mkdir(parents=True, exist_ok=True)
 
     output = save_stage1_result(
         result,

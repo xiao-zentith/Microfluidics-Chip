@@ -7,7 +7,7 @@
 
 ## Stage1
 
-### 1) 标准 Stage1（单图）
+### 1） 标准 Stage1（单图）
 
 ```bash
 python -m microfluidics_chip.pipelines.cli stage1 IMAGE_PATH -o OUTPUT_DIR

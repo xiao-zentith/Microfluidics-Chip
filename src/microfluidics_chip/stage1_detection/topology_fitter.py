@@ -105,6 +105,7 @@ class FittingResult:
     
     # 拟合信息
     transform_matrix: np.ndarray  # (2, 3) Similarity/Affine 变换矩阵
+    transform_type: str  # "similarity" / "affine" / "none"
     inlier_ratio: float  # RANSAC 内点比例
     inlier_indices: List[int]  # 内点对应的检测索引
     
@@ -123,6 +124,7 @@ class FittingResult:
             'visibility': self.visibility.tolist(),
             'detected_mask': self.detected_mask.tolist(),
             'transform_matrix': self.transform_matrix.tolist(),
+            'transform_type': self.transform_type,
             'inlier_ratio': self.inlier_ratio,
             'inlier_indices': self.inlier_indices,
             'dark_chamber_indices': self.dark_chamber_indices,
@@ -206,7 +208,7 @@ class TopologyFitter:
         detected_centers = np.array(detected_centers, dtype=np.float32)
         
         # Step 1: RANSAC Similarity Transform
-        transform, inlier_indices, reproj_error = self._ransac_similarity(
+        transform, inlier_indices, reproj_error, transform_type = self._ransac_similarity(
             detected_centers, image_shape
         )
         
@@ -236,6 +238,7 @@ class TopologyFitter:
             visibility=visibility,
             detected_mask=detected_mask,
             transform_matrix=transform,
+            transform_type=transform_type,
             inlier_ratio=len(inlier_indices) / len(detected_centers) if len(detected_centers) > 0 else 0,
             inlier_indices=inlier_indices,
             dark_chamber_indices=dark_indices,
@@ -248,7 +251,7 @@ class TopologyFitter:
         self,
         src_points: np.ndarray,
         image_shape: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], List[int], float]:
+    ) -> Tuple[Optional[np.ndarray], List[int], float, str]:
         """
         RANSAC 拟合 Similarity Transform
         
@@ -310,9 +313,9 @@ class TopologyFitter:
             if self.config.fallback_to_affine and len(src_points) >= 3:
                 return self._fallback_affine(src_points, image_shape)
             
-            return None, [], float('inf')
+            return None, [], float('inf'), "none"
         
-        return best_transform, best_inliers, best_error
+        return best_transform, best_inliers, best_error, "similarity"
     
     def _find_best_template_match(
         self,
@@ -366,7 +369,7 @@ class TopologyFitter:
         self,
         src_points: np.ndarray,
         image_shape: Tuple[int, int]
-    ) -> Tuple[Optional[np.ndarray], List[int], float]:
+    ) -> Tuple[Optional[np.ndarray], List[int], float, str]:
         """回退到 Affine Transform"""
         logger.info("Falling back to Affine transform")
         
@@ -388,7 +391,7 @@ class TopologyFitter:
         transformed = self._transform_template(M)
         inliers, error = self._count_inliers(src_points, transformed)
         
-        return M, inliers, error
+        return M, inliers, error, "affine"
     
     def _transform_template(self, M: np.ndarray) -> np.ndarray:
         """应用变换矩阵到模板"""
@@ -566,6 +569,7 @@ class TopologyFitter:
             visibility=np.zeros(12, dtype=bool),
             detected_mask=np.zeros(12, dtype=bool),
             transform_matrix=np.eye(2, 3, dtype=np.float32),
+            transform_type="none",
             inlier_ratio=0.0,
             inlier_indices=[],
             dark_chamber_indices=[],
