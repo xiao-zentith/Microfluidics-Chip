@@ -117,6 +117,25 @@ python -m microfluidics_chip.pipelines.cli stage1 \
   data/chip001.png \
   -o data/experiments/stage1 \
   --no-adaptive
+
+# 消融1：仅普通 YOLO（无后处理）
+python -m microfluidics_chip.pipelines.cli stage1-yolo \
+  data/chip001.png \
+  -o data/experiments/stage1_yolo
+
+# 消融2：仅两阶段 YOLO（粗到精 + ROI，仍无后处理）
+python -m microfluidics_chip.pipelines.cli stage1-yolo-adaptive \
+  data/chip001.png \
+  -o data/experiments/stage1_yolo_adaptive
+
+# 消融3：仅后处理（读取上一步的检测 JSON）
+python -m microfluidics_chip.pipelines.cli stage1-post \
+  data/experiments/stage1_yolo_adaptive/chip001/adaptive_yolo_raw_detections.json \
+  -o data/experiments/stage1_post
+
+# 后处理默认执行：拓扑拟合回填到固定12点 + 4末端亮度最小判定唯一BLANK
+# 可通过 --min-topology-detections 调整最小点数阈值（默认跟随配置 min_detections）
+# 拟合失败可用 --fallback-detection 触发宽松两阶段重检
 ```
 
 启用 `--adaptive` 时，`stage1_metadata.json` 会额外包含：

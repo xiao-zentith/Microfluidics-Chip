@@ -28,6 +28,14 @@ from ..core.io import save_stage1_result
 from ..core.logger import get_logger
 from ..stage1_detection.detector import ChamberDetector
 from ..stage1_detection.geometry_engine import CrossGeometryEngine
+from ..stage1_detection.adaptive_detector import (
+    AdaptiveDetector,
+    AdaptiveDetectionConfig as InternalAdaptiveDetectionConfig
+)
+from ..stage1_detection.topology_fitter import (
+    TopologyFitter,
+    TopologyConfig as InternalTopologyConfig
+)
 from ..stage1_detection.preprocess import preprocess_image
 from ..stage1_detection.inference import infer_stage1, infer_stage1_adaptive, infer_stage1_from_detections
 
@@ -74,6 +82,358 @@ def _draw_yolo_detections(raw_image: np.ndarray, detections: List[ChamberDetecti
 
     return vis
 
+
+def _draw_adaptive_yolo_detections(
+    raw_image: np.ndarray,
+    detections: List[ChamberDetection],
+    roi_bbox: Tuple[int, int, int, int],
+    cluster_score: float,
+    is_fallback: bool
+) -> np.ndarray:
+    """
+    绘制自适应两阶段 YOLO 检测结果（仅检测，不含拓扑/几何后处理）。
+    """
+    vis = _draw_yolo_detections(raw_image, detections)
+    x1, y1, x2, y2 = roi_bbox
+    color = (0, 255, 255) if not is_fallback else (0, 165, 255)
+
+    cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+    label = f"ROI score={cluster_score:.2f} fallback={int(is_fallback)}"
+    (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+    ty = max(y1, th + baseline + 6)
+    cv2.rectangle(vis, (x1, ty - th - baseline - 6), (x1 + tw + 6, ty), color, -1)
+    cv2.putText(
+        vis,
+        label,
+        (x1 + 3, ty - baseline - 3),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    return vis
+
+
+def _build_internal_adaptive_config(config: Stage1Config) -> InternalAdaptiveDetectionConfig:
+    """
+    将配置对象中的自适应参数转换为 AdaptiveDetector 所需 dataclass。
+    """
+    adaptive_config = config.adaptive_detection or AdaptiveDetectionConfig()
+    return InternalAdaptiveDetectionConfig(
+        coarse_imgsz=adaptive_config.coarse_imgsz,
+        coarse_conf=adaptive_config.coarse_conf,
+        fine_imgsz=adaptive_config.fine_imgsz,
+        fine_conf=adaptive_config.fine_conf,
+        cluster_eps=adaptive_config.cluster_eps,
+        cluster_min_samples=adaptive_config.cluster_min_samples,
+        roi_margin=adaptive_config.roi_margin,
+        min_roi_size=adaptive_config.min_roi_size,
+        enable_clahe=adaptive_config.enable_clahe,
+        clahe_clip_limit=adaptive_config.clahe_clip_limit,
+    )
+
+
+def _build_internal_topology_config(config: Stage1Config) -> InternalTopologyConfig:
+    """
+    将配置对象中的拓扑参数转换为 TopologyFitter 所需 dataclass。
+    """
+    topology_config = config.topology or TopologyConfig()
+    return InternalTopologyConfig(
+        template_scale=topology_config.template_scale,
+        template_path=topology_config.template_path,
+        ransac_iters=topology_config.ransac_iters,
+        ransac_threshold=topology_config.ransac_threshold,
+        min_inliers=topology_config.min_inliers,
+        visibility_margin=topology_config.visibility_margin,
+        brightness_roi_size=topology_config.brightness_roi_size,
+        dark_percentile=topology_config.dark_percentile,
+        fallback_to_affine=topology_config.fallback_to_affine,
+    )
+
+
+def _compute_rotation_scale_from_matrix(matrix: np.ndarray) -> Tuple[float, float]:
+    """
+    从 2x3 仿射矩阵估计旋转角与缩放因子。
+    """
+    m = np.asarray(matrix, dtype=np.float32)
+    if m.shape != (2, 3):
+        return 0.0, 0.0
+
+    sx = float(np.sqrt(m[0, 0] ** 2 + m[1, 0] ** 2))
+    sy = float(np.sqrt(m[0, 1] ** 2 + m[1, 1] ** 2))
+    scale = float((sx + sy) / 2.0)
+    rotation = float(np.degrees(np.arctan2(m[1, 0], m[0, 0])))
+    return rotation, scale
+
+
+def _compute_coverage_arms(detected_mask: np.ndarray) -> float:
+    """
+    计算模板四臂覆盖率（至少命中一个点的臂占比）。
+    """
+    if detected_mask.shape[0] < 12:
+        return 0.0
+
+    covered = 0
+    for arm in ARM_TEMPLATE_INDICES:
+        if any(bool(detected_mask[idx]) for idx in arm):
+            covered += 1
+    return covered / len(ARM_TEMPLATE_INDICES)
+
+
+def _compute_candidate_dark_score(
+    raw_image: np.ndarray,
+    center: Tuple[float, float],
+    roi_size: int
+) -> Optional[float]:
+    """
+    使用圆形 ROI 上 V 通道鲁棒统计计算暗腔室分数（越低越暗）。
+    """
+    h, w = raw_image.shape[:2]
+    cx, cy = float(center[0]), float(center[1])
+    half = max(4, int(roi_size // 2))
+
+    x1 = max(0, int(cx - half))
+    y1 = max(0, int(cy - half))
+    x2 = min(w, int(cx + half))
+    y2 = min(h, int(cy + half))
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    roi = raw_image[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    v_channel = hsv[:, :, 2].astype(np.float32)
+
+    local_cx = cx - x1
+    local_cy = cy - y1
+    yy, xx = np.ogrid[:v_channel.shape[0], :v_channel.shape[1]]
+    radius = max(3.0, min(v_channel.shape[0], v_channel.shape[1]) * 0.45)
+    circle_mask = ((xx - local_cx) ** 2 + (yy - local_cy) ** 2) <= radius ** 2
+
+    pixels = v_channel[circle_mask]
+    if pixels.size < 20:
+        pixels = v_channel.reshape(-1)
+    if pixels.size == 0:
+        return None
+
+    p10 = float(np.percentile(pixels, 10))
+    median = float(np.median(pixels))
+    return 0.7 * p10 + 0.3 * median
+
+
+def _select_blank_from_outermost(
+    raw_image: np.ndarray,
+    fitted_centers: np.ndarray,
+    roi_size: int
+) -> Tuple[List[int], Dict[int, float], float]:
+    """
+    在四个末端候选中按亮度最小规则选唯一 blank。
+    """
+    blank_scores: Dict[int, float] = {}
+    for idx in OUTERMOST_TEMPLATE_INDICES:
+        if idx >= fitted_centers.shape[0]:
+            continue
+        score = _compute_candidate_dark_score(
+            raw_image=raw_image,
+            center=(float(fitted_centers[idx, 0]), float(fitted_centers[idx, 1])),
+            roi_size=roi_size
+        )
+        if score is not None:
+            blank_scores[idx] = float(score)
+
+    if not blank_scores:
+        return [], {}, 0.0
+
+    blank_idx = min(blank_scores, key=blank_scores.get)
+    sorted_scores = sorted(blank_scores.values())
+    if len(sorted_scores) > 1:
+        gap = sorted_scores[1] - sorted_scores[0]
+        blank_confidence = float(np.clip(gap / (sorted_scores[1] + 1e-6), 0.0, 1.0))
+    else:
+        blank_confidence = 0.0
+
+    return [int(blank_idx)], blank_scores, blank_confidence
+
+
+def _build_relaxed_post_adaptive_config(config: Stage1Config) -> AdaptiveDetectionConfig:
+    """
+    构建后处理失败时的宽松重检参数。
+    """
+    base = (config.adaptive_detection or AdaptiveDetectionConfig()).model_copy(deep=True)
+    base.coarse_conf = max(0.02, base.coarse_conf * 0.60)
+    base.fine_conf = max(0.08, base.fine_conf * 0.60)
+    base.fine_imgsz = int(base.fine_imgsz + 256)
+    base.enable_clahe = True
+    return base
+
+
+def _run_topology_refine_postprocess(
+    chip_id: str,
+    raw_image: np.ndarray,
+    source_detections: List[ChamberDetection],
+    config: Stage1Config,
+    min_topology_detections: int,
+    source_tag: str,
+    geometry_engine: Optional[CrossGeometryEngine] = None
+) -> Tuple[List[ChamberDetection], Dict[str, Any]]:
+    """
+    对检测点执行拓扑拟合回填，输出固定12点几何检测及 QC。
+    """
+    n_det = len(source_detections)
+    if n_det < min_topology_detections:
+        raise RuntimeError(
+            f"postprocess_qc_failed: insufficient_detections_for_topology "
+            f"(n_det={n_det}, min_required={min_topology_detections})"
+        )
+
+    topology_cfg = _build_internal_topology_config(config)
+    fitter = TopologyFitter(topology_cfg)
+
+    detected_centers = np.array([d.center for d in source_detections], dtype=np.float32)
+    fitting_result = fitter.fit_and_fill(
+        detected_centers=detected_centers,
+        image_shape=raw_image.shape[:2],
+        image=None
+    )
+
+    rotation_deg, scale = _compute_rotation_scale_from_matrix(fitting_result.transform_matrix)
+    coverage_arms = _compute_coverage_arms(fitting_result.detected_mask)
+    n_inliers = int(len(fitting_result.inlier_indices))
+    rmse_px = float(fitting_result.reprojection_error)
+    blank_indices, blank_scores, blank_confidence = _select_blank_from_outermost(
+        raw_image=raw_image,
+        fitted_centers=np.asarray(fitting_result.fitted_centers, dtype=np.float32),
+        roi_size=topology_cfg.brightness_roi_size
+    )
+    fit_success_qc = bool(
+        fitting_result.fit_success
+        and n_inliers >= int(topology_cfg.min_inliers)
+        and np.isfinite(rmse_px)
+        and coverage_arms >= 0.25
+        and scale > 0.0
+    )
+
+    qc: Dict[str, Any] = {
+        "source": source_tag,
+        "n_det": int(n_det),
+        "n_inliers": int(n_inliers),
+        "n_filled": int(max(0, 12 - int(np.sum(fitting_result.detected_mask)))),
+        "rmse_px": float(rmse_px),
+        "inlier_ratio": float(fitting_result.inlier_ratio),
+        "coverage_arms": float(coverage_arms),
+        "scale": float(scale),
+        "rotation": float(rotation_deg),
+        "blank_scores": {str(k): float(v) for k, v in blank_scores.items()},
+        "blank_confidence": float(blank_confidence),
+        "blank_indices": [int(x) for x in blank_indices],
+        "fit_success_raw": bool(fitting_result.fit_success),
+        "fit_success": bool(fit_success_qc),
+    }
+
+    if not fit_success_qc:
+        raise RuntimeError(
+            "postprocess_qc_failed: topology_fit_failed "
+            f"(n_det={n_det}, n_inliers={n_inliers}, rmse_px={rmse_px:.2f}, coverage_arms={coverage_arms:.2f})"
+        )
+    if not blank_indices:
+        raise RuntimeError(
+            "postprocess_qc_failed: blank_unresolved "
+            f"(n_det={n_det}, coverage_arms={coverage_arms:.2f})"
+        )
+
+    adaptive_result = AdaptiveDetectionResult(
+        detections=source_detections,
+        roi_bbox=(0, 0, int(raw_image.shape[1]), int(raw_image.shape[0])),
+        cluster_score=0.0,
+        is_fallback=(source_tag != "json"),
+        fitted_centers=np.asarray(fitting_result.fitted_centers, dtype=np.float32),
+        visibility=np.asarray(fitting_result.visibility, dtype=bool),
+        detected_mask=np.asarray(fitting_result.detected_mask, dtype=bool),
+        dark_chamber_indices=blank_indices,
+        inlier_ratio=float(fitting_result.inlier_ratio),
+        reprojection_error=float(fitting_result.reprojection_error),
+        fit_success=bool(fitting_result.fit_success),
+        processing_time=0.0
+    )
+
+    effective_geometry_engine = geometry_engine or CrossGeometryEngine(config.geometry)
+    geometry_detections = _build_geometry_detections(
+        adaptive_result=adaptive_result,
+        geometry_engine=effective_geometry_engine,
+        class_id_blank=config.yolo.class_id_blank,
+        class_id_lit=config.yolo.class_id_lit,
+        force_blank_if_missing=False
+    )
+    return geometry_detections, qc
+
+
+def _load_detection_payload(detections_json_path: Path) -> Dict[str, Any]:
+    """
+    读取检测结果 JSON。
+    """
+    path = Path(detections_json_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Detection json not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if "detections" not in payload:
+        raise ValueError(f"Detection json missing 'detections': {path}")
+    return payload
+
+
+def _parse_detections_from_payload(
+    payload: Dict[str, Any],
+    source_path: Path
+) -> List[ChamberDetection]:
+    """
+    将 JSON payload 解析为 ChamberDetection 列表。
+    """
+    raw_detections = payload.get("detections")
+    if not isinstance(raw_detections, list):
+        raise ValueError(f"Invalid detections format in {source_path}")
+
+    detections: List[ChamberDetection] = []
+    for idx, item in enumerate(raw_detections):
+        try:
+            detections.append(ChamberDetection.model_validate(item))
+        except Exception as e:
+            raise ValueError(
+                f"Invalid detection at index {idx} in {source_path}: {e}"
+            ) from e
+    return detections
+
+
+def _resolve_raw_image_path(
+    detections_json_path: Path,
+    payload: Dict[str, Any],
+    raw_image_override: Optional[Path]
+) -> Path:
+    """
+    解析后处理要使用的原图路径。
+    """
+    if raw_image_override is not None:
+        candidate = Path(raw_image_override)
+        if not candidate.exists():
+            raise FileNotFoundError(f"Raw image not found: {candidate}")
+        return candidate
+
+    raw_rel = payload.get("raw_image_path")
+    candidates: List[Path] = []
+    if isinstance(raw_rel, str) and raw_rel:
+        candidates.append(detections_json_path.parent / raw_rel)
+    candidates.append(detections_json_path.parent / "raw.png")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        f"Cannot resolve raw image for {detections_json_path}. "
+        f"Tried: {[str(p) for p in candidates]}"
+    )
 
 def _build_unique_assignment(
     fitted_centers: np.ndarray,
@@ -748,6 +1108,349 @@ def run_stage1_yolo_only_batch(
 
     logger.info(
         f"YOLO-only batch complete: {len(outputs)} success, {len(image_paths) - len(outputs)} failed"
+    )
+    return outputs
+
+
+def run_stage1_yolo_adaptive_only(
+    chip_id: str,
+    raw_image_path: Path,
+    output_dir: Path,
+    config: Stage1Config,
+    detector: Optional[ChamberDetector] = None,
+) -> Dict[str, Any]:
+    """
+    仅执行“两阶段 YOLO 检测”：
+    global coarse scan -> cluster ROI -> fine scan。
+    不执行拓扑拟合与几何后处理。
+
+    输出文件:
+    - raw.png
+    - adaptive_yolo_raw_detections.png
+    - adaptive_yolo_raw_detections.json
+    """
+    start = time.time()
+
+    raw_image = cv2.imread(str(raw_image_path))
+    if raw_image is None:
+        raise FileNotFoundError(f"Cannot read raw image: {raw_image_path}")
+
+    if detector is None:
+        detector = ChamberDetector(config.yolo)
+
+    adaptive_detector = AdaptiveDetector(_build_internal_adaptive_config(config), detector)
+    detections, cluster_result = adaptive_detector.detect_adaptive(raw_image)
+
+    vis = _draw_adaptive_yolo_detections(
+        raw_image=raw_image,
+        detections=detections,
+        roi_bbox=cluster_result.roi_bbox,
+        cluster_score=cluster_result.cluster_score,
+        is_fallback=cluster_result.is_fallback,
+    )
+
+    run_dir = Path(output_dir) / chip_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_name = "raw.png"
+    vis_name = "adaptive_yolo_raw_detections.png"
+    meta_name = "adaptive_yolo_raw_detections.json"
+
+    cv2.imwrite(str(run_dir / raw_name), raw_image)
+    cv2.imwrite(str(run_dir / vis_name), vis)
+
+    adaptive_cfg = config.adaptive_detection or AdaptiveDetectionConfig()
+    payload: Dict[str, Any] = {
+        "chip_id": chip_id,
+        "raw_image_path": raw_name,
+        "visualization_path": vis_name,
+        "num_detections": len(detections),
+        "detections": [d.model_dump() for d in detections],
+        "roi_bbox": list(cluster_result.roi_bbox),
+        "cluster_score": float(cluster_result.cluster_score),
+        "is_fallback": bool(cluster_result.is_fallback),
+        "num_clusters_found": int(cluster_result.num_clusters_found),
+        "cluster_centers": [list(c) for c in cluster_result.cluster_centers],
+        "adaptive_config": adaptive_cfg.model_dump(),
+        "processing_time": time.time() - start,
+    }
+
+    with open(run_dir / meta_name, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        f"[{chip_id}] Adaptive YOLO-only inference saved: {run_dir / vis_name} "
+        f"(detections={len(detections)}, cluster_score={cluster_result.cluster_score:.2f})"
+    )
+    return payload
+
+
+def run_stage1_yolo_adaptive_only_batch(
+    input_dir: Path,
+    output_dir: Path,
+    config: Stage1Config,
+    image_extensions: List[str] = [".png", ".jpg", ".jpeg"],
+    skip_suffix: str = "_gt",
+) -> List[Dict[str, Any]]:
+    """
+    批量“两阶段 YOLO 仅检测”推理（不进行拓扑/几何后处理）。
+    """
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image_paths: List[Path] = []
+    for ext in image_extensions:
+        for p in input_dir.glob(f"*{ext}"):
+            if skip_suffix and skip_suffix in p.stem:
+                continue
+            image_paths.append(p)
+
+    if not image_paths:
+        logger.warning(f"No image files found in {input_dir}")
+        return []
+
+    logger.info(f"Found {len(image_paths)} images for adaptive YOLO-only batch inference")
+    detector = ChamberDetector(config.yolo)
+
+    outputs: List[Dict[str, Any]] = []
+    for p in tqdm(image_paths, desc="Adaptive YOLO-only stage1"):
+        chip_id = p.stem
+        try:
+            out = run_stage1_yolo_adaptive_only(
+                chip_id=chip_id,
+                raw_image_path=p,
+                output_dir=output_dir,
+                config=config,
+                detector=detector,
+            )
+            outputs.append(out)
+        except Exception as e:
+            logger.error(f"✗ {chip_id} failed in adaptive YOLO-only mode: {e}")
+
+    logger.info(
+        "Adaptive YOLO-only batch complete: "
+        f"{len(outputs)} success, {len(image_paths) - len(outputs)} failed"
+    )
+    return outputs
+
+
+def run_stage1_postprocess_from_json(
+    detections_json_path: Path,
+    output_dir: Path,
+    config: Stage1Config,
+    raw_image_path: Optional[Path] = None,
+    chip_id: Optional[str] = None,
+    min_topology_detections: Optional[int] = None,
+    enable_fallback_detection: bool = True,
+    geometry_engine: Optional[CrossGeometryEngine] = None,
+    save_individual_slices: bool = False,
+    save_debug: bool = True
+) -> Stage1Output:
+    """
+    仅执行 Stage1 后处理（几何校正 + 切片），检测结果从 JSON 读取。
+
+    支持输入：
+    - stage1-yolo 的 yolo_raw_detections.json
+    - stage1-yolo-adaptive 的 adaptive_yolo_raw_detections.json
+    """
+    detections_json_path = Path(detections_json_path)
+    payload = _load_detection_payload(detections_json_path)
+    detections_from_json = _parse_detections_from_payload(payload, detections_json_path)
+    resolved_raw_image = _resolve_raw_image_path(
+        detections_json_path=detections_json_path,
+        payload=payload,
+        raw_image_override=raw_image_path
+    )
+
+    final_chip_id = chip_id or payload.get("chip_id") or resolved_raw_image.stem
+
+    raw_image = cv2.imread(str(resolved_raw_image))
+    if raw_image is None:
+        raise FileNotFoundError(f"Cannot read raw image: {resolved_raw_image}")
+
+    effective_geometry_engine = geometry_engine or CrossGeometryEngine(config.geometry)
+    runtime_cfg = config.adaptive_runtime or AdaptiveRuntimeConfig()
+    min_required = int(
+        min_topology_detections
+        if min_topology_detections is not None
+        else runtime_cfg.min_detections
+    )
+    min_required = max(2, min(12, min_required))
+
+    selected_detections = detections_from_json
+    selected_source = "json"
+    qc: Dict[str, Any] = {}
+
+    try:
+        geometry_detections, qc = _run_topology_refine_postprocess(
+            chip_id=final_chip_id,
+            raw_image=raw_image,
+            source_detections=selected_detections,
+            config=config,
+            min_topology_detections=min_required,
+            source_tag=selected_source,
+            geometry_engine=effective_geometry_engine
+        )
+    except Exception as first_err:
+        if not enable_fallback_detection:
+            raise RuntimeError(str(first_err)) from first_err
+
+        logger.warning(
+            f"[{final_chip_id}] postprocess topology refine failed from json detections: {first_err}. "
+            "Retrying with relaxed adaptive detection."
+        )
+        try:
+            detector = ChamberDetector(config.yolo)
+        except Exception as detector_err:
+            if str(config.yolo.device).startswith("cuda"):
+                logger.warning(
+                    f"[{final_chip_id}] fallback detector init on cuda failed ({detector_err}), retry on cpu."
+                )
+                cpu_yolo_cfg = config.yolo.model_copy(deep=True)
+                cpu_yolo_cfg.device = "cpu"
+                detector = ChamberDetector(cpu_yolo_cfg)
+            else:
+                raise
+        relaxed_cfg = _build_relaxed_post_adaptive_config(config)
+        adaptive_detector = AdaptiveDetector(
+            InternalAdaptiveDetectionConfig(
+                coarse_imgsz=relaxed_cfg.coarse_imgsz,
+                coarse_conf=relaxed_cfg.coarse_conf,
+                fine_imgsz=relaxed_cfg.fine_imgsz,
+                fine_conf=relaxed_cfg.fine_conf,
+                cluster_eps=relaxed_cfg.cluster_eps,
+                cluster_min_samples=relaxed_cfg.cluster_min_samples,
+                roi_margin=relaxed_cfg.roi_margin,
+                min_roi_size=relaxed_cfg.min_roi_size,
+                enable_clahe=relaxed_cfg.enable_clahe,
+                clahe_clip_limit=relaxed_cfg.clahe_clip_limit,
+            ),
+            detector
+        )
+        fallback_detections, _ = adaptive_detector.detect_adaptive(raw_image)
+        selected_detections = fallback_detections
+        selected_source = "fallback_adaptive"
+
+        geometry_detections, qc = _run_topology_refine_postprocess(
+            chip_id=final_chip_id,
+            raw_image=raw_image,
+            source_detections=selected_detections,
+            config=config,
+            min_topology_detections=min_required,
+            source_tag=selected_source,
+            geometry_engine=effective_geometry_engine
+        )
+        qc["fallback_reason"] = str(first_err)
+
+    qc.update(
+        {
+            "source_detections_json": str(detections_json_path),
+            "input_detection_count": int(len(detections_from_json)),
+            "selected_detection_count": int(len(selected_detections)),
+            "min_topology_detections": int(min_required),
+        }
+    )
+
+    logger.info(
+        f"[{final_chip_id}] postprocess QC: source={qc.get('source')}, "
+        f"n_det={qc.get('n_det')}, n_inliers={qc.get('n_inliers')}, rmse_px={qc.get('rmse_px'):.2f}, "
+        f"coverage_arms={qc.get('coverage_arms'):.2f}, scale={qc.get('scale'):.3f}, "
+        f"rotation={qc.get('rotation'):.2f}, blank_scores={qc.get('blank_scores')}, "
+        f"blank_confidence={qc.get('blank_confidence'):.3f}"
+    )
+
+    result = infer_stage1_from_detections(
+        chip_id=final_chip_id,
+        raw_image=raw_image,
+        gt_image=None,
+        detections_raw=geometry_detections,
+        config=config,
+        geometry_engine=effective_geometry_engine,
+        quality_metrics=qc,
+        quality_gate_passed=bool(qc.get("fit_success", False)),
+        detection_mode="postprocess_topology_refined",
+        retry_attempt=1 if selected_source != "json" else 0
+    )
+
+    run_dir = Path(output_dir) / final_chip_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    output = save_stage1_result(
+        result,
+        run_dir,
+        save_gt=False,
+        save_individual_slices=save_individual_slices
+    )
+
+    if save_debug and result.debug_vis is not None:
+        debug_path = run_dir / "debug_detection.png"
+        cv2.imwrite(str(debug_path), result.debug_vis)
+        logger.info(f"[{final_chip_id}] Debug visualization saved: debug_detection.png")
+
+    logger.info(
+        f"[{final_chip_id}] Stage1 postprocess-only output saved to: {run_dir} "
+        f"(source={detections_json_path.name})"
+    )
+    return output
+
+
+def run_stage1_postprocess_batch(
+    input_dir: Path,
+    output_dir: Path,
+    config: Stage1Config,
+    json_name: Optional[str] = None,
+    min_topology_detections: Optional[int] = None,
+    enable_fallback_detection: bool = True,
+    save_individual_slices: bool = False,
+    save_debug: bool = True
+) -> List[Stage1Output]:
+    """
+    批量执行 Stage1 后处理（检测结果来自 JSON）。
+
+    默认会递归查找：
+    - yolo_raw_detections.json
+    - adaptive_yolo_raw_detections.json
+    """
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if json_name:
+        detection_jsons = sorted(input_dir.rglob(json_name))
+    else:
+        collected: List[Path] = []
+        for name in ("yolo_raw_detections.json", "adaptive_yolo_raw_detections.json"):
+            collected.extend(list(input_dir.rglob(name)))
+        detection_jsons = sorted({str(p.resolve()): p for p in collected}.values(), key=str)
+
+    if not detection_jsons:
+        logger.warning(f"No detection json files found in {input_dir}")
+        return []
+
+    logger.info(f"Found {len(detection_jsons)} detection json files for postprocess-only batch")
+    geometry_engine = CrossGeometryEngine(config.geometry)
+    outputs: List[Stage1Output] = []
+
+    for json_path in tqdm(detection_jsons, desc="Stage1 postprocess-only"):
+        try:
+            output = run_stage1_postprocess_from_json(
+                detections_json_path=json_path,
+                output_dir=output_dir,
+                config=config,
+                min_topology_detections=min_topology_detections,
+                enable_fallback_detection=enable_fallback_detection,
+                geometry_engine=geometry_engine,
+                save_individual_slices=save_individual_slices,
+                save_debug=save_debug
+            )
+            outputs.append(output)
+        except Exception as e:
+            logger.error(f"✗ postprocess failed for {json_path}: {e}")
+
+    logger.info(
+        "Stage1 postprocess-only batch complete: "
+        f"{len(outputs)} success, {len(detection_jsons) - len(outputs)} failed"
     )
     return outputs
 

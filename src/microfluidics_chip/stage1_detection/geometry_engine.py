@@ -278,7 +278,7 @@ class CrossGeometryEngine:
         
         for k, (rx, ry, r_cls) in enumerate(real_points):
             # 标记空白腔（红圈）
-            if r_cls == 0:  # CLASS_ID_BLANK
+            if r_cls == self.config.class_id_blank:
                 cv2.circle(vis, (int(rx), int(ry)), 25, (0, 0, 255), 3)
                 cv2.putText(
                     vis, "BLANK",

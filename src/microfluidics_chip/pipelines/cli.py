@@ -6,6 +6,10 @@ CLI 统一入口（使用 Typer）
 - stage1-batch: 批量处理
 - stage1-yolo: 仅 YOLO 检测（无后处理）
 - stage1-yolo-batch: 批量仅 YOLO 检测（无后处理）
+- stage1-yolo-adaptive: 两阶段 YOLO 检测（无后处理）
+- stage1-yolo-adaptive-batch: 批量两阶段 YOLO 检测（无后处理）
+- stage1-post: 仅执行后处理（检测结果来自 JSON）
+- stage1-post-batch: 批量仅执行后处理（检测结果来自 JSON）
 - stage2: Stage2 处理（只接受 --stage1-run-dir）
 - train: 训练 UNet 模型
 
@@ -26,7 +30,8 @@ from ..core.config import (
     load_config_from_yaml,
     merge_configs,
     get_default_config,
-    MicrofluidicsConfig
+    MicrofluidicsConfig,
+    AdaptiveDetectionConfig
 )
 from ..core.logger import setup_logger
 from ..pipelines.stage1 import (
@@ -34,6 +39,10 @@ from ..pipelines.stage1 import (
     run_stage1_batch,
     run_stage1_yolo_only,
     run_stage1_yolo_only_batch,
+    run_stage1_yolo_adaptive_only,
+    run_stage1_yolo_adaptive_only_batch,
+    run_stage1_postprocess_from_json,
+    run_stage1_postprocess_batch,
 )
 from ..pipelines.stage2 import run_stage2, run_stage2_batch
 
@@ -278,6 +287,206 @@ def stage1_yolo_batch_command(
             config=config.stage1,
         )
         console.print(f"[bold green]✓ YOLO-only batch processed {len(outputs)} images![/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+
+
+@app.command(name="stage1-yolo-adaptive")
+def stage1_yolo_adaptive_command(
+    raw_image: Path = typer.Argument(..., help="原始图像路径"),
+    output_dir: Path = typer.Option("runs/stage1_yolo_adaptive", "--output", "-o", help="输出目录"),
+    chip_id: Optional[str] = typer.Option(None, "--chip-id", help="芯片ID（默认从文件名提取）"),
+    config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    coarse_conf: Optional[float] = typer.Option(None, "--coarse-conf", min=0.0, max=1.0, help="粗扫描置信度覆盖"),
+    fine_conf: Optional[float] = typer.Option(None, "--fine-conf", min=0.0, max=1.0, help="精扫描置信度覆盖"),
+    fine_imgsz: Optional[int] = typer.Option(None, "--fine-imgsz", min=32, help="精扫描分辨率覆盖"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
+):
+    """
+    仅执行两阶段 YOLO 检测（粗到精 + ROI 聚类），不进行拓扑/几何后处理。
+    """
+    if chip_id is None:
+        chip_id = raw_image.stem
+
+    log_level = "DEBUG" if verbose else "INFO"
+    setup_logger(level=log_level, log_file=output_dir / chip_id / "stage1_yolo_adaptive_execution.log")
+
+    config = load_merged_config(config_file)
+    if any(v is not None for v in (coarse_conf, fine_conf, fine_imgsz)):
+        if config.stage1.adaptive_detection is None:
+            config.stage1.adaptive_detection = AdaptiveDetectionConfig()
+        if coarse_conf is not None:
+            config.stage1.adaptive_detection.coarse_conf = coarse_conf
+        if fine_conf is not None:
+            config.stage1.adaptive_detection.fine_conf = fine_conf
+        if fine_imgsz is not None:
+            config.stage1.adaptive_detection.fine_imgsz = fine_imgsz
+
+    try:
+        payload = run_stage1_yolo_adaptive_only(
+            chip_id=chip_id,
+            raw_image_path=raw_image,
+            output_dir=output_dir,
+            config=config.stage1,
+        )
+
+        table = Table(title=f"Stage1 Adaptive YOLO-only Output: {chip_id}")
+        table.add_column("Key", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Chip ID", payload["chip_id"])
+        table.add_row("Detections", str(payload["num_detections"]))
+        table.add_row("Cluster Score", f"{payload['cluster_score']:.3f}")
+        table.add_row("Fallback Cluster", str(payload["is_fallback"]))
+        table.add_row("Processing Time", f"{payload['processing_time']:.2f}s")
+        table.add_row("Output Directory", str(output_dir / chip_id))
+        console.print(table)
+        console.print("[bold green]✓ Stage1 adaptive YOLO-only complete![/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+
+
+@app.command(name="stage1-yolo-adaptive-batch")
+def stage1_yolo_adaptive_batch_command(
+    input_dir: Path = typer.Argument(..., help="输入目录"),
+    output_dir: Path = typer.Option("runs/stage1_yolo_adaptive", "--output", "-o", help="输出目录"),
+    config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    coarse_conf: Optional[float] = typer.Option(None, "--coarse-conf", min=0.0, max=1.0, help="粗扫描置信度覆盖"),
+    fine_conf: Optional[float] = typer.Option(None, "--fine-conf", min=0.0, max=1.0, help="精扫描置信度覆盖"),
+    fine_imgsz: Optional[int] = typer.Option(None, "--fine-imgsz", min=32, help="精扫描分辨率覆盖"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
+):
+    """
+    批量仅执行两阶段 YOLO 检测（不进行拓扑/几何后处理）。
+    """
+    log_level = "DEBUG" if verbose else "INFO"
+    setup_logger(level=log_level, log_file=output_dir / "stage1_yolo_adaptive_batch.log")
+
+    config = load_merged_config(config_file)
+    if any(v is not None for v in (coarse_conf, fine_conf, fine_imgsz)):
+        if config.stage1.adaptive_detection is None:
+            config.stage1.adaptive_detection = AdaptiveDetectionConfig()
+        if coarse_conf is not None:
+            config.stage1.adaptive_detection.coarse_conf = coarse_conf
+        if fine_conf is not None:
+            config.stage1.adaptive_detection.fine_conf = fine_conf
+        if fine_imgsz is not None:
+            config.stage1.adaptive_detection.fine_imgsz = fine_imgsz
+
+    try:
+        outputs = run_stage1_yolo_adaptive_only_batch(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            config=config.stage1,
+        )
+        console.print(f"[bold green]✓ Adaptive YOLO-only batch processed {len(outputs)} images![/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+
+
+@app.command(name="stage1-post")
+def stage1_post_command(
+    detections_json: Path = typer.Argument(..., help="检测结果 JSON 路径"),
+    output_dir: Path = typer.Option("runs/stage1_post", "--output", "-o", help="输出目录"),
+    raw_image: Optional[Path] = typer.Option(None, "--raw-image", help="原图路径覆盖（默认读取 JSON 中 raw_image_path）"),
+    chip_id: Optional[str] = typer.Option(None, "--chip-id", help="芯片ID覆盖"),
+    config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    min_topology_detections: Optional[int] = typer.Option(
+        None,
+        "--min-topology-detections",
+        min=2,
+        max=12,
+        help="拓扑拟合最小检测点数阈值（默认跟随配置 min_detections）"
+    ),
+    fallback_detection: bool = typer.Option(
+        True,
+        "--fallback-detection/--no-fallback-detection",
+        help="拓扑拟合失败时是否使用宽松两阶段检测重试"
+    ),
+    save_individual_slices: bool = typer.Option(False, "--save-slices", help="保存单个切片图像（调试用）"),
+    save_debug: bool = typer.Option(True, "--save-debug/--no-save-debug", help="保存检测调试图像"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
+):
+    """
+    仅执行 Stage1 后处理（几何校正 + 切片），检测结果由 JSON 提供。
+    """
+    effective_chip_id = chip_id or detections_json.parent.name
+    log_level = "DEBUG" if verbose else "INFO"
+    setup_logger(level=log_level, log_file=output_dir / effective_chip_id / "stage1_post_execution.log")
+
+    config = load_merged_config(config_file)
+
+    try:
+        output = run_stage1_postprocess_from_json(
+            detections_json_path=detections_json,
+            output_dir=output_dir,
+            config=config.stage1,
+            raw_image_path=raw_image,
+            chip_id=chip_id,
+            min_topology_detections=min_topology_detections,
+            enable_fallback_detection=fallback_detection,
+            save_individual_slices=save_individual_slices,
+            save_debug=save_debug
+        )
+
+        table = Table(title=f"Stage1 Postprocess-only Output: {output.chip_id}")
+        table.add_column("Key", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Chip ID", output.chip_id)
+        table.add_row("Chambers", str(output.num_chambers))
+        table.add_row("Processing Time", f"{output.processing_time:.2f}s")
+        table.add_row("Output Directory", str(output_dir / output.chip_id))
+        console.print(table)
+        console.print("[bold green]✓ Stage1 postprocess-only complete![/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]✗ Error: {e}[/bold red]")
+        sys.exit(1)
+
+
+@app.command(name="stage1-post-batch")
+def stage1_post_batch_command(
+    input_dir: Path = typer.Argument(..., help="输入目录（递归查找检测 JSON）"),
+    output_dir: Path = typer.Option("runs/stage1_post", "--output", "-o", help="输出目录"),
+    config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="配置文件路径"),
+    json_name: Optional[str] = typer.Option(None, "--json-name", help="仅处理指定 JSON 文件名"),
+    min_topology_detections: Optional[int] = typer.Option(
+        None,
+        "--min-topology-detections",
+        min=2,
+        max=12,
+        help="拓扑拟合最小检测点数阈值（默认跟随配置 min_detections）"
+    ),
+    fallback_detection: bool = typer.Option(
+        True,
+        "--fallback-detection/--no-fallback-detection",
+        help="拓扑拟合失败时是否使用宽松两阶段检测重试"
+    ),
+    save_individual_slices: bool = typer.Option(False, "--save-slices", help="保存单个切片图像（调试用）"),
+    save_debug: bool = typer.Option(True, "--save-debug/--no-save-debug", help="保存检测调试图像"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
+):
+    """
+    批量仅执行 Stage1 后处理（几何校正 + 切片），检测结果由 JSON 提供。
+    """
+    log_level = "DEBUG" if verbose else "INFO"
+    setup_logger(level=log_level, log_file=output_dir / "stage1_post_batch.log")
+
+    config = load_merged_config(config_file)
+
+    try:
+        outputs = run_stage1_postprocess_batch(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            config=config.stage1,
+            json_name=json_name,
+            min_topology_detections=min_topology_detections,
+            enable_fallback_detection=fallback_detection,
+            save_individual_slices=save_individual_slices,
+            save_debug=save_debug
+        )
+        console.print(f"[bold green]✓ Stage1 postprocess-only batch processed {len(outputs)} chips![/bold green]")
     except Exception as e:
         console.print(f"[bold red]✗ Error: {e}[/bold red]")
         sys.exit(1)
