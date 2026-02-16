@@ -75,6 +75,21 @@ class TopologyConfig(BaseModel):
     # 暗腔室判定
     brightness_roi_size: int = Field(default=30, description="亮度判定 ROI 尺寸")
     dark_percentile: float = Field(default=25.0, ge=0.0, le=100.0, description="暗腔室判定分位数阈值")
+    blank_mode: str = Field(default="color", description="BLANK判定模式: brightness/color/chromaticity")
+    blank_w1: float = Field(default=1.0, description="颜色判定: |Δf_rg| 权重")
+    blank_w2: float = Field(default=1.0, description="颜色判定: Δf_red 权重")
+    blank_w3: float = Field(default=0.5, description="颜色判定: Δf_s 权重")
+    blank_arm_margin_thr: float = Field(default=0.05, description="参考臂判定最小margin")
+    blank_margin_thr: float = Field(default=0.05, description="臂内BLANK判定最小margin")
+    blank_chroma_w1: float = Field(default=1.0, description="chromaticity: |df_r| 权重")
+    blank_chroma_w2: float = Field(default=1.0, description="chromaticity: |df_rg| 权重")
+    blank_chroma_w3: float = Field(default=0.5, description="chromaticity: max(df_re,0) 权重")
+    blank_chroma_w4: float = Field(default=0.5, description="chromaticity: max(df_s,0) 权重")
+    blank_chroma_arm_margin_thr: float = Field(default=0.05, description="chromaticity: 参考臂判定最小margin")
+    blank_chroma_blank_margin_thr: float = Field(default=0.02, description="chromaticity: 臂内BLANK判定最小margin")
+    blank_chroma_clip_quantile: float = Field(default=0.99, ge=0.5, le=1.0, description="chromaticity: df_rg/df_re 裁剪分位数")
+    blank_chroma_clip_rg_min: float = Field(default=0.15, gt=0.0, description="chromaticity: df_rg 最小裁剪阈值")
+    blank_chroma_clip_re_min: float = Field(default=5.0, gt=0.0, description="chromaticity: df_re 最小裁剪阈值")
     
     # 回退参数
     fallback_to_affine: bool = Field(default=True, description="Similarity 失败时是否回退到 Affine")

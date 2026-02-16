@@ -73,6 +73,22 @@ python -m microfluidics_chip.pipelines.cli stage1-post-batch \
   --json-name adaptive_yolo_raw_detections.json
 ```
 
+### 6) BLANK 模式对比（brightness vs chromaticity）
+
+```bash
+python scripts/validate_blank_modes_batch.py \
+  --input-dir data/experiments/stage1_yolo_adaptive \
+  --output-dir data/experiments/blank_mode_compare \
+  --config configs/default.yaml \
+  --template configs/templates/pinwheel_v3_centered.json \
+  --max-samples 20
+```
+
+输出：
+- `summary.csv`：每样本每模式一行（含 `blank_mode/reference_arm_pred/blank_id_pred/arm_margin/blank_margin/blank_unresolved`）
+- `compare_summary.csv`：old/new 对比
+- `key_cases/`：发生变化或低 margin 的样本
+
 ---
 
 ## Stage2

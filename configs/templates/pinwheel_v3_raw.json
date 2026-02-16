@@ -1,0 +1,67 @@
+{
+  "chip_metadata": {
+    "name": "Microfluidic_Pinwheel_4Arm_3Chamber",
+    "version": "v3.0_DXF_Verified",
+    "description": "Based on user-provided absolute DXF coordinates. Raw (non-centered) pinwheel template.",
+    "units": "mm"
+  },
+  "geometry": {
+    "approx_pitch_mm": 3.0,
+    "approx_offset_mm": 1.93,
+    "points": [
+      { "id": "R1", "x": 2.0, "y": 1.93 },
+      { "id": "R2", "x": 5.0, "y": 1.93 },
+      { "id": "R3", "x": 8.0, "y": 1.93 },
+      { "id": "D1", "x": 1.93, "y": -1.755 },
+      { "id": "D2", "x": 1.93, "y": -4.705 },
+      { "id": "D3", "x": 1.93, "y": -7.721 },
+      { "id": "L1", "x": -1.728, "y": -1.92 },
+      { "id": "L2", "x": -4.715, "y": -1.92 },
+      { "id": "L3", "x": -7.73, "y": -1.92 },
+      { "id": "U1", "x": -1.93, "y": 1.729 },
+      { "id": "U2", "x": -1.93, "y": 4.716 },
+      { "id": "U3", "x": -1.93, "y": 7.703 }
+    ]
+  },
+  "logic": {
+    "blank_candidates": ["R3", "D3", "L3", "U3"],
+    "blank_candidate_indices": [2, 5, 8, 11]
+  },
+  "centroid_mm": {
+    "mean_x": 0.0689166666666665,
+    "mean_y": -0.0002500000000000095,
+    "is_centered": false
+  },
+  "topology_fitter_compat": {
+    "template_units": "pitch",
+    "note": "TopologyFitter loads `template` then multiplies by topology.template_scale (pixel-per-pitch).",
+    "template": [
+      [0.666667, 0.643333],
+      [1.666667, 0.643333],
+      [2.666667, 0.643333],
+      [0.643333, -0.585],
+      [0.643333, -1.568333],
+      [0.643333, -2.573667],
+      [-0.576, -0.64],
+      [-1.571667, -0.64],
+      [-2.576667, -0.64],
+      [-0.643333, 0.576333],
+      [-0.643333, 1.572],
+      [-0.643333, 2.567667]
+    ]
+  },
+  "template": [
+    [0.666667, 0.643333],
+    [1.666667, 0.643333],
+    [2.666667, 0.643333],
+    [0.643333, -0.585],
+    [0.643333, -1.568333],
+    [0.643333, -2.573667],
+    [-0.576, -0.64],
+    [-1.571667, -0.64],
+    [-2.576667, -0.64],
+    [-0.643333, 0.576333],
+    [-0.643333, 1.572],
+    [-0.643333, 2.567667]
+  ]
+}

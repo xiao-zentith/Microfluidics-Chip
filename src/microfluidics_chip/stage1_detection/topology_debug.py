@@ -86,6 +86,25 @@ def _render_debug_image(raw_image: np.ndarray, payload: Dict[str, Any]) -> np.nd
     fitted_points = payload.get("fitted_points", []) or []
     blank_info = payload.get("blank", {}) or {}
     blank_id = _safe_int(blank_info.get("blank_id"))
+    blank_id_pred = _safe_int(blank_info.get("blank_id_pred"))
+    blank_id_old = _safe_int(blank_info.get("blank_id_old"))
+    blank_id_color = _safe_int(blank_info.get("blank_id_color"))
+    blank_id_chroma = _safe_int(blank_info.get("blank_id_chromaticity"))
+    blank_mode = str(blank_info.get("blank_mode", "unknown"))
+    blank_status = str(blank_info.get("blank_status", "unknown"))
+    blank_status_pred = str(blank_info.get("blank_status_pred", blank_status))
+    blank_status_color = str(blank_info.get("blank_status_color", "unknown"))
+    blank_status_chroma = str(blank_info.get("blank_status_chromaticity", "unknown"))
+    blank_margin = _safe_float(blank_info.get("blank_margin"))
+    arm_margin = _safe_float(blank_info.get("arm_margin"))
+    reference_arm = blank_info.get("reference_arm")
+    reference_arm_pred = blank_info.get("reference_arm_pred", reference_arm)
+    arm_scores = blank_info.get("arm_scores", {}) if isinstance(blank_info.get("arm_scores"), dict) else {}
+    ref_arm_ch_scores = (
+        blank_info.get("reference_arm_chamber_scores", {})
+        if isinstance(blank_info.get("reference_arm_chamber_scores"), dict)
+        else {}
+    )
     candidate_indices = set(int(i) for i in (blank_info.get("candidate_indices", []) or []))
 
     roi_bbox = _normalize_bbox(payload.get("roi_bbox"), w, h)
@@ -112,20 +131,26 @@ def _render_debug_image(raw_image: np.ndarray, payload: Dict[str, Any]) -> np.nd
     # 蓝点: fitted 12; pure-filled 空心圈
     for pt in fitted_points:
         tid = _safe_int(pt.get("template_index"))
+        tid_name = str(pt.get("template_id", tid if tid is not None else ""))
         cx = _safe_float(pt.get("x"))
         cy = _safe_float(pt.get("y"))
         if tid is None or cx is None or cy is None:
             continue
         p = _as_int_point(cx, cy)
         pure_filled = bool(pt.get("pure_filled", False))
+        arm_prefix = tid_name[:1].upper() if tid_name else ""
+        arm_name = {"U": "Up", "R": "Right", "D": "Down", "L": "Left"}.get(arm_prefix, "")
+        is_reference_arm = bool(reference_arm) and arm_name == str(reference_arm)
 
         if pure_filled:
             cv2.circle(vis, p, 9, (255, 0, 255), 2)  # hollow marker for pure-filled
+        if is_reference_arm:
+            cv2.circle(vis, p, 11, (0, 165, 255), 2)  # highlight reference arm
         cv2.circle(vis, p, 4, (255, 0, 0), -1)
         cv2.line(vis, (p[0] - 5, p[1]), (p[0] + 5, p[1]), (255, 0, 0), 1)
         cv2.line(vis, (p[0], p[1] - 5), (p[0], p[1] + 5), (255, 0, 0), 1)
         cv2.putText(
-            vis, str(tid), (p[0] + 6, p[1] - 6),
+            vis, tid_name, (p[0] + 6, p[1] - 6),
             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 220, 0), 1, cv2.LINE_AA
         )
 
@@ -135,7 +160,8 @@ def _render_debug_image(raw_image: np.ndarray, payload: Dict[str, Any]) -> np.nd
                 vis, "C", (p[0] - 4, p[1] - 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA
             )
-        if blank_id is not None and tid == blank_id:
+        final_blank_idx = blank_id_pred if blank_id_pred is not None else blank_id
+        if final_blank_idx is not None and tid == final_blank_idx:
             cv2.circle(vis, p, 18, (0, 0, 255), 2)
             cv2.putText(
                 vis, "BLANK", (p[0] - 24, p[1] - 22),
@@ -143,12 +169,25 @@ def _render_debug_image(raw_image: np.ndarray, payload: Dict[str, Any]) -> np.nd
             )
 
     fit_info = payload.get("fit", {}) or {}
+    arm_line = "arm_scores=Up:n/a Right:n/a Down:n/a Left:n/a"
+    if arm_scores:
+        def fmt(name: str) -> str:
+            val = _safe_float(arm_scores.get(name))
+            return "n/a" if val is None else f"{val:.3f}"
+        arm_line = (
+            f"arm_scores=Up:{fmt('Up')} Right:{fmt('Right')} "
+            f"Down:{fmt('Down')} Left:{fmt('Left')}"
+        )
     lines = [
         f"attempt={payload.get('attempt_id', 'n/a')} status={payload.get('status', 'unknown')}",
         f"n_det={payload.get('n_det', 0)} n_inliers={fit_info.get('n_inliers', 0)} rmse={fit_info.get('rmse_px', 'n/a')}",
         f"fit={fit_info.get('fit_success', False)} transform={fit_info.get('transform_type', 'n/a')}"
         f" scale={fit_info.get('scale', 'n/a')} rot={fit_info.get('rotation_deg', 'n/a')}",
-        "red=det green=inlier blue=fitted magenta=pure-filled yellow=outermost",
+        f"blank_mode={blank_mode} blank_id={blank_id_pred if blank_id_pred is not None else blank_id} old={blank_id_old} color={blank_id_color} chroma={blank_id_chroma}",
+        f"blank_status={blank_status_pred} raw={blank_status} color={blank_status_color} chroma={blank_status_chroma} arm_margin={arm_margin} blank_margin={blank_margin}",
+        arm_line,
+        f"reference_arm={reference_arm_pred or 'n/a'} raw={reference_arm or 'n/a'} ref_scores={ref_arm_ch_scores or {}}",
+        "red=det green=inlier blue=fitted orange=reference-arm magenta=pure-filled yellow=outermost",
     ]
     if payload.get("failure_reason"):
         lines.append(f"reason={payload['failure_reason']}")
@@ -204,4 +243,3 @@ def debug_dump_topology(
         json.dump(payload_to_dump, f, ensure_ascii=False, indent=2)
 
     return {"png": png_path, "json": json_path}
-

@@ -38,7 +38,43 @@ class CrossGeometryEngine:
         self.config = config
         self.center = (config.canvas_size // 2, config.canvas_size // 2)
         self.ideal_slice_centers = self._generate_ideal_centers()
+        self.last_process_debug: Dict[str, Any] = {}
         logger.info(f"GeometryEngine initialized (canvas={config.canvas_size})")
+
+    @staticmethod
+    def _as_homo(points: np.ndarray) -> np.ndarray:
+        ones = np.ones((points.shape[0], 1), dtype=np.float32)
+        return np.hstack([points.astype(np.float32), ones])
+
+    @staticmethod
+    def _affine_apply(M: np.ndarray, points: np.ndarray) -> np.ndarray:
+        if points.size == 0:
+            return points.astype(np.float32)
+        homo = CrossGeometryEngine._as_homo(points)
+        return (M.astype(np.float32) @ homo.T).T
+
+    def _crop_patch(self, image: np.ndarray, cx: float, cy: float) -> np.ndarray:
+        x1 = int(round(cx - self.config.crop_radius))
+        y1 = int(round(cy - self.config.crop_radius))
+        x2 = int(round(cx + self.config.crop_radius))
+        y2 = int(round(cy + self.config.crop_radius))
+
+        patch = image[
+            max(0, y1):min(image.shape[0], y2),
+            max(0, x1):min(image.shape[1], x2)
+        ]
+        if patch.size == 0:
+            return np.zeros((self.config.slice_size[1], self.config.slice_size[0], 3), dtype=np.uint8)
+        if patch.shape[0] != self.config.slice_size[0] or patch.shape[1] != self.config.slice_size[1]:
+            patch = cv2.resize(patch, self.config.slice_size)
+        return patch
+
+    def _compute_canonical_points(self, template_points: np.ndarray) -> np.ndarray:
+        pts = np.asarray(template_points, dtype=np.float32)
+        centroid = np.mean(pts, axis=0, keepdims=True)
+        centered = pts - centroid
+        canvas_center = np.array([[float(self.center[0]), float(self.center[1])]], dtype=np.float32)
+        return centered + canvas_center
     
     def _generate_ideal_centers(self) -> List[Tuple[int, int]]:
         """生成理想十字布局的12个腔室中心点"""
@@ -110,7 +146,8 @@ class CrossGeometryEngine:
     def process(
         self,
         img: np.ndarray,
-        detections: List[ChamberDetection]
+        detections: List[ChamberDetection],
+        canonical_context: Optional[Dict[str, Any]] = None
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[TransformParams], Optional[np.ndarray]]:
         """
         处理图像：拓扑排序 -> 刚性变换 -> 切片
@@ -125,6 +162,17 @@ class CrossGeometryEngine:
                  - transform_params: TransformParams
                  - debug_vis: np.ndarray（可视化图像）
         """
+        # 新路径：模板驱动 canonical 对齐（不再依赖十字理想参数）
+        if canonical_context is not None:
+            return self._process_template_driven(
+                img=img,
+                detections=detections,
+                canonical_context=canonical_context
+            )
+
+        # 兼容旧路径：十字假设几何处理
+        self.last_process_debug = {"mode": "legacy_cross"}
+
         # 校验：至少需要 12 个检测
         if len(detections) < 12:
             logger.warning(f"Insufficient detections: {len(detections)} < 12")
@@ -260,11 +308,221 @@ class CrossGeometryEngine:
             blank_arm_index=blank_arm_idx,
             matrix=M.tolist()  # 可选：保存完整矩阵
         )
+
+        self.last_process_debug = {
+            "mode": "legacy_cross",
+            "blank_arm_index": int(blank_arm_idx),
+            "rotation_angle": float(rotation_angle),
+            "scale_factor": float(scale_factor),
+            "slice_centers_aligned": [
+                [float(x), float(y)] for (x, y, _) in slice_points_real
+            ],
+        }
         
         logger.debug(f"Processed: rotation={rotation_angle:.2f}°, scale={scale_factor:.3f}")
         
         # P0 强制返回：四元组
         return aligned_image, chamber_slices, transform_params, debug_vis
+
+    def _process_template_driven(
+        self,
+        img: np.ndarray,
+        detections: List[ChamberDetection],
+        canonical_context: Dict[str, Any],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[TransformParams], Optional[np.ndarray]]:
+        """
+        模板驱动 canonical 几何路径：
+        - 输入 raw 拟合点 + 模板 canonical 点
+        - 求 raw->canonical 变换
+        - warp 后按 canonical 点切片（严格12点）
+        """
+        if len(detections) < 12:
+            logger.warning(f"Insufficient detections for template-driven mode: {len(detections)} < 12")
+            return None, None, None, None
+
+        template_points = np.asarray(canonical_context.get("template_points"), dtype=np.float32)
+        topology_fitted_raw = np.asarray(canonical_context.get("fitted_points_raw"), dtype=np.float32)
+        final_raw = np.asarray(
+            canonical_context.get("final_points_raw", canonical_context.get("fitted_points_raw")),
+            dtype=np.float32
+        )
+        if template_points.ndim != 2 or template_points.shape[0] < 12 or template_points.shape[1] != 2:
+            logger.warning("Invalid template_points for template-driven geometry")
+            return None, None, None, None
+        if final_raw.ndim != 2 or final_raw.shape[0] < 12 or final_raw.shape[1] != 2:
+            logger.warning("Invalid final_points_raw for template-driven geometry")
+            return None, None, None, None
+
+        template_points = template_points[:12]
+        final_raw = final_raw[:12]
+        if topology_fitted_raw.ndim == 2 and topology_fitted_raw.shape[0] >= 12 and topology_fitted_raw.shape[1] == 2:
+            topology_fitted_raw = topology_fitted_raw[:12]
+        else:
+            topology_fitted_raw = final_raw.copy()
+        canonical_pts = self._compute_canonical_points(template_points)
+
+        # 优先 similarity，必要时 affine
+        M, inlier_mask = cv2.estimateAffinePartial2D(
+            final_raw.reshape(-1, 1, 2),
+            canonical_pts.reshape(-1, 1, 2),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+            confidence=0.99,
+        )
+        transform_type = "similarity"
+        if M is None:
+            M, inlier_mask = cv2.estimateAffine2D(
+                final_raw.reshape(-1, 1, 2),
+                canonical_pts.reshape(-1, 1, 2),
+                method=cv2.RANSAC,
+                ransacReprojThreshold=3.0,
+                maxIters=2000,
+                confidence=0.99,
+            )
+            transform_type = "affine"
+        if M is None:
+            logger.warning("Template-driven affine solve failed")
+            return None, None, None, None
+
+        aligned = cv2.warpAffine(
+            img,
+            M,
+            (self.config.canvas_size, self.config.canvas_size),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+
+        # canonical slices (主输出)
+        canonical_slices: List[np.ndarray] = []
+        for (cx, cy) in canonical_pts:
+            canonical_slices.append(self._crop_patch(aligned, float(cx), float(cy)))
+        chamber_slices = np.asarray(canonical_slices)
+
+        # raw slices (调试输出)
+        raw_slices: List[np.ndarray] = []
+        for (rx, ry) in final_raw:
+            raw_slices.append(self._crop_patch(img, float(rx), float(ry)))
+        raw_slices_np = np.asarray(raw_slices)
+
+        # 变换一致性与投影误差
+        invM = cv2.invertAffineTransform(M.astype(np.float32))
+        projected_raw = self._affine_apply(invM, canonical_pts)
+        reproj_vec = np.linalg.norm(projected_raw - final_raw, axis=1)
+        reproj_mean = float(np.mean(reproj_vec))
+        reproj_max = float(np.max(reproj_vec))
+
+        projected_canonical = self._affine_apply(M.astype(np.float32), final_raw)
+        center_offset_vec = np.linalg.norm(projected_canonical - canonical_pts, axis=1)
+        center_offset_mean = float(np.mean(center_offset_vec))
+        center_offset_max = float(np.max(center_offset_vec))
+
+        # debug overlay (raw)
+        debug_overlay = img.copy()
+        r = int(self.config.crop_radius)
+        for i in range(12):
+            rx, ry = final_raw[i]
+            px, py = projected_raw[i]
+            cv2.circle(debug_overlay, (int(round(rx)), int(round(ry))), 4, (255, 80, 0), -1, cv2.LINE_AA)
+            cv2.circle(debug_overlay, (int(round(px)), int(round(py))), 7, (0, 255, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(
+                debug_overlay,
+                (int(round(rx)) - r, int(round(ry)) - r),
+                (int(round(rx)) + r, int(round(ry)) + r),
+                (255, 0, 255),
+                1,
+            )
+            cv2.putText(
+                debug_overlay,
+                str(i),
+                (int(round(rx)) + 6, int(round(ry)) - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 180),
+                1,
+                cv2.LINE_AA,
+            )
+            # 若 topology 拟合点与最终点不一致，叠加拟合点供审计
+            tx, ty = topology_fitted_raw[i]
+            if abs(float(tx) - float(rx)) > 1e-3 or abs(float(ty) - float(ry)) > 1e-3:
+                cv2.circle(debug_overlay, (int(round(tx)), int(round(ty))), 3, (255, 0, 0), -1, cv2.LINE_AA)
+
+        blank_idx = canonical_context.get("blank_idx")
+        if blank_idx is not None and 0 <= int(blank_idx) < 12:
+            bx, by = final_raw[int(blank_idx)]
+            cv2.circle(debug_overlay, (int(round(bx)), int(round(by))), 20, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.putText(debug_overlay, "BLANK", (int(round(bx)) - 24, int(round(by)) - 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
+
+        # aligned debug（沿用原可视化风格）
+        debug_vis = aligned.copy()
+        for i, (cx, cy) in enumerate(canonical_pts):
+            cv2.circle(debug_vis, (int(round(cx)), int(round(cy))), 3, (255, 0, 0), -1)
+            cv2.rectangle(
+                debug_vis,
+                (int(round(cx)) - r, int(round(cy)) - r),
+                (int(round(cx)) + r, int(round(cy)) + r),
+                (255, 255, 0),
+                1,
+            )
+            cv2.putText(
+                debug_vis,
+                str(i),
+                (int(round(cx)) + 5, int(round(cy)) - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 180),
+                1,
+                cv2.LINE_AA,
+            )
+
+        rotation_angle = math.degrees(math.atan2(M[1, 0], M[0, 0]))
+        scale_factor = math.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
+        blank_arm = int(blank_idx) // 3 if blank_idx is not None else 0
+        chip_centroid = tuple(np.mean(final_raw, axis=0).tolist())
+
+        transform_params = TransformParams(
+            rotation_angle=float(rotation_angle),
+            scale_factor=float(scale_factor),
+            chip_centroid=(float(chip_centroid[0]), float(chip_centroid[1])),
+            blank_arm_index=int(blank_arm),
+            matrix=M.tolist(),
+        )
+
+        inliers = int(np.sum(inlier_mask)) if inlier_mask is not None else 0
+        template_ids = canonical_context.get("template_ids") or [str(i) for i in range(12)]
+        semantic_order = canonical_context.get("semantic_order_clockwise_from_blank") or []
+
+        self.last_process_debug = {
+            "mode": "template_canonical",
+            "transform_type": transform_type,
+            "transform_matrix_raw_to_canonical": M.tolist(),
+            "inverse_transform_matrix_canonical_to_raw": invM.tolist(),
+            "n_inliers_transform": inliers,
+            "fitted_points_raw": final_raw.tolist(),
+            "topology_fitted_points_raw": topology_fitted_raw.tolist(),
+            "canonical_points": canonical_pts.tolist(),
+            "projected_raw_points": projected_raw.tolist(),
+            "template_ids": template_ids,
+            "semantic_order_clockwise_from_blank": semantic_order,
+            "point_source": canonical_context.get("point_source"),
+            "det_fit_distance_px": canonical_context.get("det_fit_distance_px"),
+            "semantic_roles_by_template": canonical_context.get("semantic_roles_by_template"),
+            "semantic_arm_role_by_template": canonical_context.get("semantic_arm_role_by_template"),
+            "blank_idx": int(blank_idx) if blank_idx is not None else None,
+            "reprojection_error_mean_px": reproj_mean,
+            "reprojection_error_max_px": reproj_max,
+            "slice_center_offset_mean_px": center_offset_mean,
+            "slice_center_offset_max_px": center_offset_max,
+            "raw_slices": raw_slices_np,
+            "debug_overlay_raw": debug_overlay,
+        }
+
+        logger.debug(
+            "Template-driven geometry: inliers=%d reproj_mean=%.3f reproj_max=%.3f center_off_max=%.3f",
+            inliers, reproj_mean, reproj_max, center_offset_max
+        )
+        return aligned, chamber_slices, transform_params, debug_vis
     
     def _draw_debug(self, img: np.ndarray, real_points: List[Tuple]) -> np.ndarray:
         """

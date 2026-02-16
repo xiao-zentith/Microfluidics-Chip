@@ -32,7 +32,8 @@ def infer_stage1_from_detections(
     quality_metrics: Optional[Dict[str, Any]] = None,
     quality_gate_passed: Optional[bool] = None,
     detection_mode: str = "standard",
-    retry_attempt: int = 0
+    retry_attempt: int = 0,
+    canonical_context: Optional[Dict[str, Any]] = None
 ) -> Stage1Result:
     """
     使用已给定的检测结果执行 Stage1 几何校正与切片提取。
@@ -54,7 +55,7 @@ def infer_stage1_from_detections(
     # ==================== 几何校正 Raw 图像 ====================
     logger.info(f"[{chip_id}] Processing geometry for raw image...")
     aligned_image, chamber_slices, transform_params, debug_vis = geometry_engine.process(
-        raw_image, detections_raw
+        raw_image, detections_raw, canonical_context=canonical_context
     )
 
     if aligned_image is None:
@@ -92,6 +93,26 @@ def infer_stage1_from_detections(
     # ==================== 计算耗时 ====================
     processing_time = time.time() - start_time
 
+    merged_metrics: Optional[Dict[str, Any]]
+    if quality_metrics is None:
+        merged_metrics = None
+    else:
+        merged_metrics = dict(quality_metrics)
+    if hasattr(geometry_engine, "last_process_debug") and isinstance(geometry_engine.last_process_debug, dict):
+        gdbg = geometry_engine.last_process_debug
+        geom_metrics = {
+            "geometry_mode": gdbg.get("mode"),
+            "geometry_transform_type": gdbg.get("transform_type"),
+            "geometry_reprojection_error_mean_px": gdbg.get("reprojection_error_mean_px"),
+            "geometry_reprojection_error_max_px": gdbg.get("reprojection_error_max_px"),
+            "geometry_slice_center_offset_mean_px": gdbg.get("slice_center_offset_mean_px"),
+            "geometry_slice_center_offset_max_px": gdbg.get("slice_center_offset_max_px"),
+            "geometry_n_inliers_transform": gdbg.get("n_inliers_transform"),
+        }
+        if merged_metrics is None:
+            merged_metrics = {}
+        merged_metrics.update({k: v for k, v in geom_metrics.items() if v is not None})
+
     # ==================== 返回内存结果 ====================
     result = Stage1Result(
         chip_id=chip_id,
@@ -102,7 +123,7 @@ def infer_stage1_from_detections(
         gt_slices=gt_slices,
         debug_vis=debug_vis,
         processing_time=processing_time,
-        quality_metrics=quality_metrics,
+        quality_metrics=merged_metrics,
         quality_gate_passed=quality_gate_passed,
         detection_mode=detection_mode,
         retry_attempt=retry_attempt

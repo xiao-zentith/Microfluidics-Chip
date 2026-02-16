@@ -23,6 +23,7 @@ src/microfluidics_chip/stage1_detection/geometry_engine.py
 src/microfluidics_chip/stage1_detection/inference.py
 src/microfluidics_chip/stage1_detection/preprocess.py
 src/microfluidics_chip/stage1_detection/synthesizer.py
+src/microfluidics_chip/stage1_detection/topology_debug.py
 src/microfluidics_chip/stage1_detection/topology_fitter.py
 src/microfluidics_chip/stage2_correction/__init__.py
 src/microfluidics_chip/stage2_correction/augmentations.py
