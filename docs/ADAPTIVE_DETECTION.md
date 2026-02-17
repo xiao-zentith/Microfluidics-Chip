@@ -49,7 +49,7 @@ python scripts/migrate_labels_to_single_class.py --data yolo_v3
 - CLAHE 默认在退化**之后**执行，避免二次噪声放大
 - 每副本独立预处理，增加多样性
 - 质量控制机制，防止 extreme 产生不可用样本
-- 默认只增强 `train` split；如需同步 `val/test`，可加 `--sync-splits`
+- 默认增强 `train` 并同步复制 `val/test`；如只需 train，可加 `--no-sync-splits`
 
 ```bash
 # 推荐用法 (默认: multiplier=3, prob=0.7)
@@ -63,10 +63,10 @@ python scripts/augment_yolo_dataset.py \
     --clahe-position before_degradation \
     --invert-prob 0.05 --verbose
 
-# 如果你已经有 val/test 并希望一并复制
+# 如果你只想输出 train（不复制 val/test）
 python scripts/augment_yolo_dataset.py \
     --input data/stage1_detection/yolo_v3/images/train \
-    --sync-splits
+    --no-sync-splits
 ```
 
 ---

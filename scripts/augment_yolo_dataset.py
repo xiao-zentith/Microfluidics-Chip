@@ -451,7 +451,7 @@ def augment_yolo_dataset(
     invert_prob: float = 0.02,  # v2.2: 概率触发
     clahe_position: str = "after_degradation",  # v2.2: CLAHE 位置控制
     # 是否同步其他 split（val/test）
-    sync_other_splits: bool = False,
+    sync_other_splits: bool = True,
     # 原地修改开关
     in_place: bool = False,
     # 日志详细程度
@@ -513,6 +513,7 @@ def augment_yolo_dataset(
     logger.info(f"Tier Ratios:        mild={mild_ratio:.0%}, medium={medium_ratio:.0%}, extreme={extreme_ratio:.0%}")
     logger.info(f"CLAHE:              enabled={enable_clahe}, position={clahe_position}")
     logger.info(f"Invert:             enabled={enable_invert}, prob={invert_prob:.1%}")
+    logger.info(f"Sync other splits:  {sync_other_splits}")
     logger.info("=" * 60)
     
     # 获取所有原始图片
@@ -603,7 +604,7 @@ def augment_yolo_dataset(
     if not in_place:
         logger.info(f"Copied {count_copied} original samples")
 
-        # 可选：同步其他 split（如 val/test）
+        # 默认：同步其他 split（如 val/test）
         if sync_other_splits:
             _sync_other_splits(
                 dataset_root=dataset_root,
@@ -638,7 +639,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
-  # Default: multiplier=3, prob=0.7, CLAHE after degradation
+  # Default: multiplier=3, prob=0.7, CLAHE after degradation, sync val/test
   python augment_yolo_dataset.py --input data/yolo_v3/images/train
 
   # Custom configuration
@@ -646,6 +647,9 @@ Example usage:
       --multiplier 2 --prob 0.8 \\
       --clahe-position before_degradation \\
       --invert-prob 0.05 --verbose
+
+  # Train-only output (do not copy val/test)
+  python augment_yolo_dataset.py --input data/yolo_v3/images/train --no-sync-splits
 """
     )
     
@@ -654,8 +658,11 @@ Example usage:
                         help="Path to images directory (e.g. data/stage1_detection/yolo_v3/images/train)")
     parser.add_argument("--output-root", type=Path, default=None, 
                         help="Root directory for the NEW dataset. Defaults to '{input_parent}_augmented'.")
-    parser.add_argument("--sync-splits", action="store_true",
-                        help="Also copy other splits (e.g., val/test) to output dataset.")
+    parser.add_argument("--sync-splits", dest="sync_splits", action="store_true",
+                        help="Copy other splits (e.g., val/test) to output dataset (default: enabled).")
+    parser.add_argument("--no-sync-splits", dest="sync_splits", action="store_false",
+                        help="Do not copy other splits (train-only output).")
+    parser.set_defaults(sync_splits=True)
     parser.add_argument("--in-place", action="store_true",
                         help="WARNING: Augment in-place (modify original dataset). Overrides --output-root.")
     
