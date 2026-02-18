@@ -90,6 +90,10 @@ class TopologyConfig(BaseModel):
     blank_chroma_clip_quantile: float = Field(default=0.99, ge=0.5, le=1.0, description="chromaticity: df_rg/df_re 裁剪分位数")
     blank_chroma_clip_rg_min: float = Field(default=0.15, gt=0.0, description="chromaticity: df_rg 最小裁剪阈值")
     blank_chroma_clip_re_min: float = Field(default=5.0, gt=0.0, description="chromaticity: df_re 最小裁剪阈值")
+    success_mode: str = Field(
+        default="geo_only",
+        description="后处理成功模式: geo_only(几何通过即可导出) / geo_and_semantic(需语义也通过)",
+    )
     
     # 回退参数
     fallback_to_affine: bool = Field(default=True, description="Similarity 失败时是否回退到 Affine")

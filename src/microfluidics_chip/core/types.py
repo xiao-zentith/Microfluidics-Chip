@@ -83,6 +83,26 @@ class Stage1Output(BaseModel):
     num_chambers: int
     processing_time: float = 0.0
     has_gt_slices: bool = False
+    geo_success: Optional[bool] = None
+    geo_quality_level: Optional[str] = None
+    semantic_ready: Optional[bool] = None
+    used_fallback: Optional[bool] = None
+    fallback_reason: Optional[str] = None
+    blank_status: Optional[str] = None
+    reference_arm_pred: Optional[str] = None
+    blank_id_pred: Optional[int] = None
+    reprojection_error_mean_px: Optional[float] = None
+    reprojection_error_max_px: Optional[float] = None
+    slice_center_offset_max_px: Optional[float] = None
+    slice_mode: Optional[str] = None
+    geometry_suspect: Optional[bool] = None
+    model_chosen: Optional[str] = None
+    fill_ratio: Optional[float] = None
+    used_real_points: Optional[int] = None
+    pitch_final: Optional[float] = None
+    n_det_raw: Optional[int] = None
+    n_det_dedup: Optional[int] = None
+    blank_valid: Optional[bool] = None
     quality_metrics: Optional[Dict[str, Any]] = None
     quality_gate_passed: Optional[bool] = None
     detection_mode: str = "standard"
@@ -166,6 +186,27 @@ def stage1_result_to_output(
     :param run_dir: 运行目录（用于日志，但不直接使用）
     :return: Stage1Output（可JSON序列化）
     """
+    qm = result.quality_metrics if isinstance(result.quality_metrics, dict) else {}
+    geo_success = qm.get("geo_success")
+    semantic_ready = qm.get("semantic_ready", qm.get("blank_pass"))
+    used_fallback = qm.get("used_fallback")
+    fallback_reason = qm.get("fallback_reason")
+    geo_quality_level = qm.get("geo_quality_level")
+    blank_status = qm.get("blank_status")
+    reference_arm_pred = qm.get("reference_arm_pred", qm.get("reference_arm"))
+    blank_id_pred = qm.get("blank_id_pred", qm.get("blank_idx"))
+    reproj_mean = qm.get("reprojection_error_mean_px", qm.get("geometry_reprojection_error_mean_px"))
+    reproj_max = qm.get("reprojection_error_max_px", qm.get("geometry_reprojection_error_max_px"))
+    center_offset = qm.get("slice_center_offset_max_px", qm.get("geometry_slice_center_offset_max_px"))
+    slice_mode = qm.get("slice_mode")
+    geometry_suspect = qm.get("geometry_suspect")
+    model_chosen = qm.get("model_chosen")
+    fill_ratio = qm.get("fill_ratio")
+    used_real_points = qm.get("used_real_points")
+    pitch_final = qm.get("pitch_final", qm.get("pitch_px"))
+    n_det_raw = qm.get("n_det_raw")
+    n_det_dedup = qm.get("n_det_dedup")
+    blank_valid = qm.get("blank_valid")
     return Stage1Output(
         chip_id=result.chip_id,
         aligned_image_path="aligned.png",  # P2: 固定名称
@@ -175,6 +216,26 @@ def stage1_result_to_output(
         num_chambers=len(result.chambers),
         processing_time=result.processing_time,
         has_gt_slices=(result.gt_slices is not None),
+        geo_success=(None if geo_success is None else bool(geo_success)),
+        geo_quality_level=(None if geo_quality_level is None else str(geo_quality_level)),
+        semantic_ready=(None if semantic_ready is None else bool(semantic_ready)),
+        used_fallback=(None if used_fallback is None else bool(used_fallback)),
+        fallback_reason=(None if fallback_reason is None else str(fallback_reason)),
+        blank_status=(None if blank_status is None else str(blank_status)),
+        reference_arm_pred=(None if reference_arm_pred is None else str(reference_arm_pred)),
+        blank_id_pred=(None if blank_id_pred is None else int(blank_id_pred)),
+        reprojection_error_mean_px=(None if reproj_mean is None else float(reproj_mean)),
+        reprojection_error_max_px=(None if reproj_max is None else float(reproj_max)),
+        slice_center_offset_max_px=(None if center_offset is None else float(center_offset)),
+        slice_mode=(None if slice_mode is None else str(slice_mode)),
+        geometry_suspect=(None if geometry_suspect is None else bool(geometry_suspect)),
+        model_chosen=(None if model_chosen is None else str(model_chosen)),
+        fill_ratio=(None if fill_ratio is None else float(fill_ratio)),
+        used_real_points=(None if used_real_points is None else int(used_real_points)),
+        pitch_final=(None if pitch_final is None else float(pitch_final)),
+        n_det_raw=(None if n_det_raw is None else int(n_det_raw)),
+        n_det_dedup=(None if n_det_dedup is None else int(n_det_dedup)),
+        blank_valid=(None if blank_valid is None else bool(blank_valid)),
         quality_metrics=result.quality_metrics,
         quality_gate_passed=result.quality_gate_passed,
         detection_mode=result.detection_mode,

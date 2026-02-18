@@ -67,6 +67,7 @@ stage1:
     blank_chroma_clip_quantile: 0.99
     blank_chroma_clip_rg_min: 0.15
     blank_chroma_clip_re_min: 5.0
+    success_mode: "geo_only"
     fallback_to_affine: true
 
   # 自适应运行策略（默认关闭，按需通过 CLI 或配置启用）

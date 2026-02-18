@@ -405,6 +405,11 @@ def stage1_post_command(
         "--fallback-detection/--no-fallback-detection",
         help="拓扑拟合失败时是否使用宽松两阶段检测重试"
     ),
+    export_geo_even_if_blank_unresolved: bool = typer.Option(
+        True,
+        "--export-geo-even-if-blank-unresolved/--strict-semantic-success",
+        help="几何通过即导出切片；关闭时要求语义(Blank/ReferenceArm)也通过",
+    ),
     save_individual_slices: bool = typer.Option(False, "--save-slices", help="保存单个切片图像（调试用）"),
     save_debug: bool = typer.Option(True, "--save-debug/--no-save-debug", help="保存检测调试图像"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
@@ -427,6 +432,7 @@ def stage1_post_command(
             chip_id=chip_id,
             min_topology_detections=min_topology_detections,
             enable_fallback_detection=fallback_detection,
+            export_geo_even_if_blank_unresolved=export_geo_even_if_blank_unresolved,
             save_individual_slices=save_individual_slices,
             save_debug=save_debug
         )
@@ -463,6 +469,11 @@ def stage1_post_batch_command(
         "--fallback-detection/--no-fallback-detection",
         help="拓扑拟合失败时是否使用宽松两阶段检测重试"
     ),
+    export_geo_even_if_blank_unresolved: bool = typer.Option(
+        True,
+        "--export-geo-even-if-blank-unresolved/--strict-semantic-success",
+        help="几何通过即导出切片；关闭时要求语义(Blank/ReferenceArm)也通过",
+    ),
     save_individual_slices: bool = typer.Option(False, "--save-slices", help="保存单个切片图像（调试用）"),
     save_debug: bool = typer.Option(True, "--save-debug/--no-save-debug", help="保存检测调试图像"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="详细日志")
@@ -483,6 +494,7 @@ def stage1_post_batch_command(
             json_name=json_name,
             min_topology_detections=min_topology_detections,
             enable_fallback_detection=fallback_detection,
+            export_geo_even_if_blank_unresolved=export_geo_even_if_blank_unresolved,
             save_individual_slices=save_individual_slices,
             save_debug=save_debug
         )

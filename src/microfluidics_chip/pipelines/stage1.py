@@ -62,11 +62,11 @@ ARM_NAME_TO_INDICES = {
     "bottom": ARM_TEMPLATE_INDICES[2],
     "left": ARM_TEMPLATE_INDICES[3],
 }
-ALPHA_MATCH = 0.25
+ALPHA_MATCH = 0.35
 ALPHA_INLIER = 0.20
 DET_KEEP_RATIO = 0.08
-DET_REJECT_RATIO = 0.18
-POST_QC_MAX_PURE_FILLED_RATIO = 0.50
+DET_REJECT_RATIO = 0.30
+POST_QC_MAX_PURE_FILLED_RATIO = 0.67
 POST_QC_MIN_MATCHED_COVERAGE_ARMS = 0.75
 POST_QC_REQUIRE_BLANK_DETECTED = False
 POST_QC_MIN_MATCHED_COUNT_BASE = 5
@@ -74,10 +74,44 @@ POST_QC_MIN_BLANK_CONFIDENCE = 0.01
 POST_QC_MIN_BLANK_SCORE_SPREAD = 6.0
 POST_QC_MAX_GEOMETRY_REPROJ_RATIO = 0.25
 POST_QC_MAX_SLICE_CENTER_OFFSET_PX = 8.0
+POST_QC_HARD_GEOMETRY_REPROJ_RATIO = 0.60
+POST_QC_HARD_SLICE_CENTER_OFFSET_PX = 13.0
 BLANK_MARGIN_THRESHOLD = 6.0
 BLANK_FILLED_MARGIN_SCALE = 1.5
 BLANK_FILLED_MIN_MATCHED_COUNT = 9
 BLANK_FILLED_MIN_DET_USED_COUNT = 8
+
+# Stage1-post 几何收敛阈值集中配置（避免散落补丁）
+POSTPROCESS_RECOVERY_CFG: Dict[str, float] = {
+    # Det cleanup
+    "dedup_eps_ratio": 0.40,
+    "dedup_eps_fallback_px": 10.0,
+    "dedup_eps_min_px": 8.0,
+    "dedup_eps_max_px": 48.0,
+    "dedup_close_pair_ratio": 0.40,
+    # Pitch
+    "pitch_knn_k": 3.0,
+    "pitch_small_dist_ratio": 0.50,
+    "pitch_min_px": 20.0,
+    "pitch_max_px": 120.0,
+    "pitch_guard_low_px": 20.0,
+    # Transform model selection
+    "affine_force_gain": 0.80,
+    "homography_force_gain": 0.75,
+    "homography_projective_max_abs": 0.01,
+    # Slice fallback trigger
+    "fallback_reproj_ratio": 0.35,
+    "fallback_min_real_points": 8.0,
+    "fallback_max_fill_ratio": 0.33,
+    "fallback_crop_radius_ratio": 0.55,
+    "fallback_crop_radius_min_px": 12.0,
+    "fallback_crop_radius_max_px": 96.0,
+    # Low-coverage assignment recovery
+    "relaxed_match_min_det": 12.0,
+    "relaxed_match_trigger_count": 8.0,
+    "relaxed_match_thresh_ratio": 1.20,
+    "relaxed_reject_det_ratio": 1.20,
+}
 
 
 class TopologyPostprocessError(RuntimeError):
@@ -88,6 +122,19 @@ class TopologyPostprocessError(RuntimeError):
         super().__init__(message)
         self.message = message
         self.debug_payload = debug_payload or {}
+
+
+def _classify_postprocess_failure_bucket(reason: Optional[str]) -> str:
+    text = str(reason or "").lower()
+    if "insufficient_detections_for_topology" in text:
+        return "fail_n_det_lt_min"
+    if "topology_fit_failed" in text:
+        return "fail_topology_fit"
+    if "geometry_alignment_failed" in text:
+        return "fail_geometry_alignment"
+    if "cannot read raw image" in text or "raw image" in text or "file not found" in text:
+        return "fail_io_or_missing_raw"
+    return "fail_io_or_missing_raw"
 
 
 def _draw_yolo_detections(raw_image: np.ndarray, detections: List[ChamberDetection]) -> np.ndarray:
@@ -279,6 +326,79 @@ def _build_semantic_roles(
     return semantic_order_clockwise_from_blank, roles_by_template, arm_role_by_template
 
 
+def _arm_indices_from_template_ids(template_ids: List[str]) -> Dict[str, List[int]]:
+    arms: Dict[str, List[int]] = {"Up": [], "Right": [], "Down": [], "Left": []}
+    for idx, tid in enumerate(template_ids[:12]):
+        t = str(tid).strip().upper()
+        if t.startswith("U"):
+            arms["Up"].append(idx)
+        elif t.startswith("R"):
+            arms["Right"].append(idx)
+        elif t.startswith("D"):
+            arms["Down"].append(idx)
+        elif t.startswith("L"):
+            arms["Left"].append(idx)
+    if any(len(v) != 3 for v in arms.values()):
+        return {
+            "Up": list(ARM_TEMPLATE_INDICES[0]),
+            "Right": list(ARM_TEMPLATE_INDICES[1]),
+            "Down": list(ARM_TEMPLATE_INDICES[2]),
+            "Left": list(ARM_TEMPLATE_INDICES[3]),
+        }
+    return arms
+
+
+def _normalize_arm_name(name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    text = str(name).strip().lower()
+    mapping = {
+        "up": "Up",
+        "top": "Up",
+        "right": "Right",
+        "down": "Down",
+        "bottom": "Down",
+        "left": "Left",
+    }
+    return mapping.get(text)
+
+
+def _select_blank_with_outermost_constraint(
+    blank_indices: List[int],
+    blank_scores: Dict[int, float],
+    reference_arm: Optional[str],
+    template_ids: List[str],
+    candidate_indices: List[int],
+) -> Tuple[Optional[int], List[int], bool]:
+    candidates_outer = sorted(
+        int(i) for i in candidate_indices
+        if int(i) in set(OUTERMOST_TEMPLATE_INDICES) and 0 <= int(i) < 12
+    )
+    if not candidates_outer:
+        candidates_outer = list(OUTERMOST_TEMPLATE_INDICES)
+    arm_name = _normalize_arm_name(reference_arm)
+    arms = _arm_indices_from_template_ids(template_ids)
+    allowed = list(candidates_outer)
+    if arm_name is not None and arm_name in arms and len(arms[arm_name]) > 0:
+        arm_outer = int(arms[arm_name][-1])
+        allowed = [arm_outer] if arm_outer in candidates_outer else [arm_outer]
+
+    selected = None
+    # 首先尝试沿用原 blank 预测（但必须属于 allowed）
+    for idx in blank_indices:
+        if int(idx) in allowed:
+            selected = int(idx)
+            break
+    # 然后按 score 在 allowed 内挑最小
+    if selected is None and blank_scores:
+        scored_allowed = [(int(i), float(blank_scores[int(i)])) for i in allowed if int(i) in blank_scores]
+        if scored_allowed:
+            selected = int(min(scored_allowed, key=lambda kv: kv[1])[0])
+    # 最后仍无结果时，不强行给值
+    is_outer = bool(selected in OUTERMOST_TEMPLATE_INDICES) if selected is not None else False
+    return selected, allowed, is_outer
+
+
 def _compute_rotation_scale_from_matrix(matrix: np.ndarray) -> Tuple[float, float]:
     """
     从 2x3 仿射矩阵估计旋转角与缩放因子。
@@ -321,21 +441,26 @@ def _compute_canonical_points_from_template(
 
 def _estimate_affine_raw_to_canonical(
     raw_points: np.ndarray,
-    canonical_points: np.ndarray
+    canonical_points: np.ndarray,
+    model_type: str = "similarity",
 ) -> Tuple[Optional[np.ndarray], str]:
     if raw_points.shape[0] < 3 or canonical_points.shape[0] < 3:
         return None, "none"
 
-    M, _ = cv2.estimateAffinePartial2D(
-        raw_points.reshape(-1, 1, 2),
-        canonical_points.reshape(-1, 1, 2),
-        method=cv2.RANSAC,
-        ransacReprojThreshold=3.0,
-        maxIters=2000,
-        confidence=0.99,
-    )
-    transform_type = "similarity"
-    if M is None:
+    model = str(model_type).strip().lower()
+    if model in {"similarity", "sim"}:
+        M, _ = cv2.estimateAffinePartial2D(
+            raw_points.reshape(-1, 1, 2),
+            canonical_points.reshape(-1, 1, 2),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+            confidence=0.99,
+        )
+        if M is not None:
+            return M.astype(np.float32), "similarity"
+        return None, "none"
+    if model == "affine":
         M, _ = cv2.estimateAffine2D(
             raw_points.reshape(-1, 1, 2),
             canonical_points.reshape(-1, 1, 2),
@@ -344,10 +469,236 @@ def _estimate_affine_raw_to_canonical(
             maxIters=2000,
             confidence=0.99,
         )
-        transform_type = "affine"
-    if M is None:
+        if M is not None:
+            return M.astype(np.float32), "affine"
         return None, "none"
-    return M.astype(np.float32), transform_type
+    if model == "homography" and raw_points.shape[0] >= 4:
+        H, _ = cv2.findHomography(
+            raw_points.reshape(-1, 1, 2),
+            canonical_points.reshape(-1, 1, 2),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+            confidence=0.99,
+        )
+        if H is not None:
+            return H.astype(np.float32), "homography"
+    return None, "none"
+
+
+def _apply_transform_points(
+    points: np.ndarray,
+    matrix: np.ndarray,
+    model_type: str,
+) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 2 or pts.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    m = np.asarray(matrix, dtype=np.float32)
+    model = str(model_type).strip().lower()
+    if model == "homography":
+        if m.shape != (3, 3):
+            return np.empty((0, 2), dtype=np.float32)
+        out = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), m).reshape(-1, 2)
+        return out.astype(np.float32)
+    if m.shape != (2, 3):
+        return np.empty((0, 2), dtype=np.float32)
+    out = cv2.transform(pts.reshape(-1, 1, 2), m).reshape(-1, 2)
+    return out.astype(np.float32)
+
+
+def _compute_transform_errors(
+    raw_points: np.ndarray,
+    canonical_points: np.ndarray,
+    matrix: Optional[np.ndarray],
+    model_type: str,
+) -> Tuple[float, float, float, np.ndarray]:
+    if matrix is None:
+        return float("inf"), float("inf"), float("inf"), np.empty((0,), dtype=np.float32)
+    pred = _apply_transform_points(raw_points, matrix, model_type)
+    if pred.shape != canonical_points.shape:
+        return float("inf"), float("inf"), float("inf"), np.empty((0,), dtype=np.float32)
+    err = np.linalg.norm(pred - canonical_points.astype(np.float32), axis=1).astype(np.float32)
+    if err.size == 0:
+        return float("inf"), float("inf"), float("inf"), err
+    return (
+        float(np.median(err)),
+        float(np.mean(err)),
+        float(np.max(err)),
+        err,
+    )
+
+
+def _fit_transform_model_with_score(
+    raw_points: np.ndarray,
+    canonical_points: np.ndarray,
+    model_type: str,
+) -> Dict[str, Any]:
+    model = str(model_type).strip().lower()
+    out: Dict[str, Any] = {
+        "model": model,
+        "matrix": None,
+        "inliers_count": 0,
+        "reproj_median": float("inf"),
+        "reproj_mean": float("inf"),
+        "reproj_max": float("inf"),
+        "errors": np.empty((0,), dtype=np.float32),
+        "valid": False,
+    }
+    if raw_points.shape[0] < 3:
+        return out
+    if model == "homography" and raw_points.shape[0] < 4:
+        return out
+
+    if model in {"similarity", "sim"}:
+        matrix, inlier_mask = cv2.estimateAffinePartial2D(
+            raw_points.reshape(-1, 1, 2),
+            canonical_points.reshape(-1, 1, 2),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+            confidence=0.99,
+        )
+        model = "similarity"
+    elif model == "affine":
+        matrix, inlier_mask = cv2.estimateAffine2D(
+            raw_points.reshape(-1, 1, 2),
+            canonical_points.reshape(-1, 1, 2),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+            confidence=0.99,
+        )
+    elif model == "homography":
+        matrix, inlier_mask = cv2.findHomography(
+            raw_points.reshape(-1, 1, 2),
+            canonical_points.reshape(-1, 1, 2),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+            confidence=0.99,
+        )
+    else:
+        return out
+
+    out["model"] = model
+    if matrix is None:
+        return out
+    inliers_count = int(np.sum(inlier_mask)) if inlier_mask is not None else 0
+    reproj_median, reproj_mean, reproj_max, errors = _compute_transform_errors(
+        raw_points=raw_points,
+        canonical_points=canonical_points,
+        matrix=np.asarray(matrix, dtype=np.float32),
+        model_type=model,
+    )
+    out.update(
+        {
+            "matrix": np.asarray(matrix, dtype=np.float32),
+            "inliers_count": int(inliers_count),
+            "reproj_median": float(reproj_median),
+            "reproj_mean": float(reproj_mean),
+            "reproj_max": float(reproj_max),
+            "errors": errors,
+            "valid": bool(np.isfinite(reproj_median)),
+        }
+    )
+    return out
+
+
+def _homography_sanity_check(matrix: Optional[np.ndarray], points: np.ndarray) -> bool:
+    if matrix is None:
+        return False
+    H = np.asarray(matrix, dtype=np.float32)
+    if H.shape != (3, 3):
+        return False
+    if not np.all(np.isfinite(H)):
+        return False
+    projective = float(max(abs(H[2, 0]), abs(H[2, 1])))
+    if projective > float(POSTPROCESS_RECOVERY_CFG["homography_projective_max_abs"]):
+        return False
+    projected = _apply_transform_points(points, H, "homography")
+    if projected.shape[0] != points.shape[0]:
+        return False
+    return bool(np.all(np.isfinite(projected)))
+
+
+def _choose_transform_model(
+    raw_points: np.ndarray,
+    canonical_points: np.ndarray,
+    point_sources: List[str],
+) -> Dict[str, Any]:
+    real_indices = [
+        int(i)
+        for i, s in enumerate(point_sources)
+        if str(s) in {"det", "det_mid"}
+    ]
+    if len(real_indices) < 3:
+        # 兜底：过少真实点时，退化为使用所有点拟合 similarity
+        real_indices = list(range(min(raw_points.shape[0], canonical_points.shape[0])))
+
+    raw_real = raw_points[np.asarray(real_indices, dtype=np.int32)].astype(np.float32)
+    canonical_real = canonical_points[np.asarray(real_indices, dtype=np.int32)].astype(np.float32)
+
+    sim = _fit_transform_model_with_score(raw_real, canonical_real, "similarity")
+    aff = _fit_transform_model_with_score(raw_real, canonical_real, "affine")
+    hom = _fit_transform_model_with_score(raw_real, canonical_real, "homography")
+    if not _homography_sanity_check(hom.get("matrix"), raw_real):
+        hom["valid"] = False
+        hom["reproj_median"] = float("inf")
+        hom["reproj_mean"] = float("inf")
+        hom["reproj_max"] = float("inf")
+
+    candidates = [c for c in (sim, aff, hom) if bool(c.get("valid"))]
+    if not candidates:
+        return {
+            "model_chosen": "none",
+            "matrix": None,
+            "score_sim": float("inf"),
+            "score_affine": float("inf"),
+            "score_h": float("inf"),
+            "inliers_count_sim": 0,
+            "inliers_count_affine": 0,
+            "inliers_count_h": 0,
+            "reproj_median": float("inf"),
+            "reproj_mean": float("inf"),
+            "reproj_max": float("inf"),
+            "real_indices": real_indices,
+            "used_filled_points_for_transform": 0,
+        }
+
+    chosen = min(candidates, key=lambda c: float(c.get("reproj_median", float("inf"))))
+    score_sim = float(sim.get("reproj_median", float("inf")))
+    score_aff = float(aff.get("reproj_median", float("inf")))
+    score_h = float(hom.get("reproj_median", float("inf")))
+
+    # similarity 与 affine 同时可用时，允许强制 affine
+    if np.isfinite(score_sim) and np.isfinite(score_aff):
+        if score_aff < float(POSTPROCESS_RECOVERY_CFG["affine_force_gain"]) * score_sim:
+            chosen = aff
+
+    # homography 必须显著优于 affine/similarity 才启用
+    base_best = min(
+        score for score in [score_sim, score_aff] if np.isfinite(score)
+    ) if any(np.isfinite(v) for v in [score_sim, score_aff]) else float("inf")
+    if np.isfinite(score_h) and np.isfinite(base_best):
+        if score_h < float(POSTPROCESS_RECOVERY_CFG["homography_force_gain"]) * base_best:
+            chosen = hom
+
+    return {
+        "model_chosen": str(chosen.get("model", "none")),
+        "matrix": chosen.get("matrix"),
+        "score_sim": score_sim,
+        "score_affine": score_aff,
+        "score_h": score_h,
+        "inliers_count_sim": int(sim.get("inliers_count", 0)),
+        "inliers_count_affine": int(aff.get("inliers_count", 0)),
+        "inliers_count_h": int(hom.get("inliers_count", 0)),
+        "reproj_median": float(chosen.get("reproj_median", float("inf"))),
+        "reproj_mean": float(chosen.get("reproj_mean", float("inf"))),
+        "reproj_max": float(chosen.get("reproj_max", float("inf"))),
+        "real_indices": real_indices,
+        "used_filled_points_for_transform": 0,
+    }
 
 
 def _estimate_pitch_from_points(points: np.ndarray) -> float:
@@ -361,6 +712,256 @@ def _estimate_pitch_from_points(points: np.ndarray) -> float:
     if nn.size == 0:
         return float("nan")
     return float(np.median(nn))
+
+
+def _compute_knn_distances(points: np.ndarray, k: int) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+        return np.empty((0,), dtype=np.float32)
+    dmat = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+    np.fill_diagonal(dmat, np.inf)
+    k_eff = int(max(1, min(int(k), pts.shape[0] - 1)))
+    k_small = np.partition(dmat, kth=k_eff - 1, axis=1)[:, :k_eff]
+    flat = k_small.reshape(-1)
+    flat = flat[np.isfinite(flat) & (flat > 0.0)]
+    return flat.astype(np.float32)
+
+
+def _estimate_pitch_robust_from_points(points: np.ndarray) -> Dict[str, Any]:
+    pts = np.asarray(points, dtype=np.float32)
+    out = {
+        "pitch_raw": float("nan"),
+        "pitch_filtered": float("nan"),
+        "discard_threshold": float("nan"),
+        "k_neighbors": int(POSTPROCESS_RECOVERY_CFG["pitch_knn_k"]),
+        "n_samples": int(0),
+    }
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+        return out
+    d = _compute_knn_distances(pts, int(POSTPROCESS_RECOVERY_CFG["pitch_knn_k"]))
+    out["n_samples"] = int(d.size)
+    if d.size == 0:
+        return out
+    med = float(np.median(d))
+    p10 = float(np.percentile(d, 10))
+    small_cut = float(POSTPROCESS_RECOVERY_CFG["pitch_small_dist_ratio"] * med)
+    discard_thr = float(max(p10, small_cut))
+    d_filtered = d[d >= discard_thr]
+    if d_filtered.size == 0:
+        d_filtered = d
+    out["pitch_raw"] = float(med)
+    out["pitch_filtered"] = float(np.median(d_filtered))
+    out["discard_threshold"] = float(discard_thr)
+    return out
+
+
+def _estimate_pitch_from_roi_or_fallback(
+    roi_bbox: Optional[Any],
+    geometry_engine: CrossGeometryEngine,
+) -> Tuple[float, str]:
+    if isinstance(roi_bbox, (list, tuple)) and len(roi_bbox) == 4:
+        try:
+            x1, y1, x2, y2 = [float(v) for v in roi_bbox]
+            rw = max(1.0, x2 - x1)
+            rh = max(1.0, y2 - y1)
+            pitch = float(min(rw, rh) / 6.0)
+            if np.isfinite(pitch) and pitch > 1.0:
+                return pitch, "roi_extent_over_6"
+        except Exception:
+            pass
+    fallback = float(max(8.0, geometry_engine.config.ideal_chamber_step))
+    return fallback, "geometry_step_fallback"
+
+
+def _build_detection_clusters(
+    source_detections: List[ChamberDetection],
+    eps_px: float,
+) -> Tuple[List[ChamberDetection], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not source_detections:
+        return [], [], []
+    centers = np.asarray([d.center for d in source_detections], dtype=np.float32)
+    n = int(centers.shape[0])
+    visited = np.zeros((n,), dtype=bool)
+    clusters: List[List[int]] = []
+
+    dmat = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+    for seed in range(n):
+        if visited[seed]:
+            continue
+        q = [seed]
+        visited[seed] = True
+        comp: List[int] = []
+        while q:
+            idx = q.pop()
+            comp.append(int(idx))
+            neighbors = np.where(dmat[idx] <= float(eps_px))[0].tolist()
+            for nb in neighbors:
+                if not visited[nb]:
+                    visited[nb] = True
+                    q.append(int(nb))
+        comp.sort()
+        clusters.append(comp)
+
+    merged: List[ChamberDetection] = []
+    merged_meta: List[Dict[str, Any]] = []
+    cluster_rows: List[Dict[str, Any]] = []
+    for cid, members in enumerate(clusters):
+        pts = np.asarray([source_detections[i].center for i in members], dtype=np.float32)
+        confs = np.asarray(
+            [max(float(source_detections[i].confidence), 1e-6) for i in members],
+            dtype=np.float32,
+        )
+        w = confs / np.sum(confs)
+        center = np.sum(pts * w[:, None], axis=0).astype(np.float32)
+        rep_idx = max(members, key=lambda i: float(source_detections[i].confidence))
+        rep = source_detections[rep_idx]
+        merged_conf = float(np.max(confs))
+        merged_det = ChamberDetection(
+            bbox=rep.bbox,
+            center=(float(center[0]), float(center[1])),
+            class_id=int(rep.class_id),
+            confidence=float(merged_conf),
+        )
+        merged.append(merged_det)
+        merged_meta.append(
+            {
+                "cluster_id": int(cid),
+                "members_idx": [int(i) for i in members],
+                "representative_idx": int(rep_idx),
+                "cluster_size": int(len(members)),
+            }
+        )
+        cluster_rows.append(
+            {
+                "cluster_id": int(cid),
+                "members_idx": [int(i) for i in members],
+                "cluster_size": int(len(members)),
+                "merged_center": [float(center[0]), float(center[1])],
+                "merged_conf": float(merged_conf),
+                "representative_idx": int(rep_idx),
+            }
+        )
+    return merged, merged_meta, cluster_rows
+
+
+def _prepare_postprocess_detections(
+    source_detections: List[ChamberDetection],
+    roi_bbox: Optional[Any],
+    geometry_engine: CrossGeometryEngine,
+) -> Dict[str, Any]:
+    n_det_raw = int(len(source_detections))
+    raw_centers = (
+        np.asarray([d.center for d in source_detections], dtype=np.float32)
+        if source_detections
+        else np.empty((0, 2), dtype=np.float32)
+    )
+    pitch_raw_info = _estimate_pitch_robust_from_points(raw_centers)
+    pitch_raw = float(pitch_raw_info.get("pitch_filtered", float("nan")))
+    if not np.isfinite(pitch_raw):
+        pitch_raw = float(pitch_raw_info.get("pitch_raw", float("nan")))
+    pitch_fb, pitch_fb_method = _estimate_pitch_from_roi_or_fallback(roi_bbox=roi_bbox, geometry_engine=geometry_engine)
+    pitch_init = float(pitch_raw if np.isfinite(pitch_raw) else pitch_fb)
+
+    dedup_eps = float(
+        np.clip(
+            float(POSTPROCESS_RECOVERY_CFG["dedup_eps_ratio"]) * pitch_init,
+            float(POSTPROCESS_RECOVERY_CFG["dedup_eps_min_px"]),
+            float(POSTPROCESS_RECOVERY_CFG["dedup_eps_max_px"]),
+        )
+    ) if np.isfinite(pitch_init) else float(POSTPROCESS_RECOVERY_CFG["dedup_eps_fallback_px"])
+
+    has_close_pair = False
+    min_pair_dist = float("inf")
+    if raw_centers.shape[0] >= 2:
+        dmat = np.linalg.norm(raw_centers[:, None, :] - raw_centers[None, :, :], axis=2)
+        np.fill_diagonal(dmat, np.inf)
+        min_pair_dist = float(np.min(dmat))
+        close_thr = float(
+            max(
+                POSTPROCESS_RECOVERY_CFG["dedup_eps_fallback_px"],
+                POSTPROCESS_RECOVERY_CFG["dedup_close_pair_ratio"] * (pitch_init if np.isfinite(pitch_init) else 25.0),
+            )
+        )
+        has_close_pair = bool(np.isfinite(min_pair_dist) and min_pair_dist <= close_thr)
+
+    pitch_guard_triggered = False
+    if n_det_raw > 12 and (not np.isfinite(pitch_raw) or pitch_raw < float(POSTPROCESS_RECOVERY_CFG["pitch_guard_low_px"])):
+        pitch_guard_triggered = True
+
+    trigger_cleanup = bool(n_det_raw > 12 or has_close_pair)
+    clusters: List[Dict[str, Any]] = []
+    dedup_meta: List[Dict[str, Any]] = []
+    if trigger_cleanup and n_det_raw > 0:
+        cleaned_dets, dedup_meta, clusters = _build_detection_clusters(
+            source_detections=source_detections,
+            eps_px=dedup_eps,
+        )
+    else:
+        cleaned_dets = list(source_detections)
+        for idx in range(n_det_raw):
+            det = source_detections[idx]
+            dedup_meta.append(
+                {
+                    "cluster_id": int(idx),
+                    "members_idx": [int(idx)],
+                    "representative_idx": int(idx),
+                    "cluster_size": 1,
+                }
+            )
+            clusters.append(
+                {
+                    "cluster_id": int(idx),
+                    "members_idx": [int(idx)],
+                    "cluster_size": 1,
+                    "merged_center": [float(det.center[0]), float(det.center[1])],
+                    "merged_conf": float(det.confidence),
+                    "representative_idx": int(idx),
+                }
+            )
+
+    dedup_centers = (
+        np.asarray([d.center for d in cleaned_dets], dtype=np.float32)
+        if cleaned_dets
+        else np.empty((0, 2), dtype=np.float32)
+    )
+    pitch_filtered_info = _estimate_pitch_robust_from_points(dedup_centers)
+    pitch_filtered = float(pitch_filtered_info.get("pitch_filtered", float("nan")))
+    if not np.isfinite(pitch_filtered):
+        pitch_filtered = float(pitch_filtered_info.get("pitch_raw", float("nan")))
+    if not np.isfinite(pitch_filtered):
+        pitch_filtered = float(pitch_raw if np.isfinite(pitch_raw) else pitch_fb)
+    pitch_final = float(np.clip(
+        pitch_filtered,
+        float(POSTPROCESS_RECOVERY_CFG["pitch_min_px"]),
+        float(POSTPROCESS_RECOVERY_CFG["pitch_max_px"]),
+    ))
+    if not np.isfinite(pitch_filtered) or abs(pitch_final - pitch_filtered) > 1e-6:
+        pitch_guard_triggered = True
+    if n_det_raw > 12 and pitch_final < float(POSTPROCESS_RECOVERY_CFG["pitch_guard_low_px"]):
+        pitch_guard_triggered = True
+
+    pitch_method = "knn3_filtered_dedup" if trigger_cleanup else "knn3_filtered"
+    if (not np.isfinite(pitch_filtered)) and np.isfinite(pitch_fb):
+        pitch_method = f"{pitch_method}|{pitch_fb_method}"
+
+    return {
+        "detections_clean": cleaned_dets,
+        "dedup_meta": dedup_meta,
+        "clusters": clusters,
+        "n_det_raw": n_det_raw,
+        "n_det_dedup": int(len(cleaned_dets)),
+        "trigger_cleanup": bool(trigger_cleanup),
+        "has_close_pair": bool(has_close_pair),
+        "min_pair_dist_px": None if not np.isfinite(min_pair_dist) else float(min_pair_dist),
+        "dedup_eps_px": float(dedup_eps),
+        "pitch_raw": float(pitch_raw_info.get("pitch_raw", float("nan"))),
+        "pitch_filtered": float(pitch_filtered),
+        "pitch_final": float(pitch_final),
+        "pitch_guard_triggered": bool(pitch_guard_triggered),
+        "pitch_method": str(pitch_method),
+        "pitch_raw_debug": pitch_raw_info,
+        "pitch_filtered_debug": pitch_filtered_info,
+    }
 
 
 def _build_final_points_det_priority(
@@ -415,7 +1016,7 @@ def _build_final_points_det_priority(
                 det_used_count += 1
             elif d >= reject_thr:
                 final_points[idx] = p_fit
-                point_sources.append("fit_reject_det")
+                point_sources.append("filled")
                 reject_det_count += 1
             else:
                 final_points[idx] = p_det
@@ -427,7 +1028,7 @@ def _build_final_points_det_priority(
             matched_det_indices.append(-1)
             det_points.append(None)
             final_points[idx] = p_fit
-            point_sources.append("fill")
+            point_sources.append("filled")
             fill_count += 1
 
         final_points_list.append([float(final_points[idx, 0]), float(final_points[idx, 1])])
@@ -1052,9 +1653,10 @@ def _build_relaxed_post_adaptive_config(config: Stage1Config) -> AdaptiveDetecti
     构建后处理失败时的宽松重检参数。
     """
     base = (config.adaptive_detection or AdaptiveDetectionConfig()).model_copy(deep=True)
-    base.coarse_conf = max(0.02, base.coarse_conf * 0.60)
-    base.fine_conf = max(0.08, base.fine_conf * 0.60)
-    base.fine_imgsz = int(base.fine_imgsz + 256)
+    # Geo-unlock preset: aggressively increase recall for fallback detection.
+    base.coarse_conf = 0.008
+    base.fine_conf = 0.008
+    base.fine_imgsz = int(max(1536, base.fine_imgsz))
     base.enable_clahe = True
     return base
 
@@ -1071,21 +1673,41 @@ def _run_topology_refine_postprocess(
     used_fallback: bool,
     roi_bbox: Optional[Any] = None,
     detection_params: Optional[Dict[str, Any]] = None,
-    geometry_engine: Optional[CrossGeometryEngine] = None
+    geometry_engine: Optional[CrossGeometryEngine] = None,
+    export_geo_even_if_blank_unresolved: Optional[bool] = None,
 ) -> Tuple[List[ChamberDetection], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """
     对检测点执行拓扑拟合回填，输出固定12点几何检测及 QC。
     """
-    n_det = len(source_detections)
+    n_det_raw = int(len(source_detections))
     effective_geometry_engine = geometry_engine or CrossGeometryEngine(config.geometry)
     topology_cfg = _build_internal_topology_config(config)
+    topo_user_cfg = config.topology or TopologyConfig()
+    success_mode = str(getattr(topo_user_cfg, "success_mode", "geo_only")).strip().lower()
+    if success_mode not in {"geo_only", "geo_and_semantic"}:
+        success_mode = "geo_only"
+    export_geo = (
+        bool(export_geo_even_if_blank_unresolved)
+        if export_geo_even_if_blank_unresolved is not None
+        else (success_mode != "geo_and_semantic")
+    )
     template_ids, blank_candidate_indices, template_name = _load_template_semantics(topology_cfg.template_path)
 
-    pitch_px, pitch_method = _estimate_pitch_px(
+    prep = _prepare_postprocess_detections(
         source_detections=source_detections,
         roi_bbox=roi_bbox,
         geometry_engine=effective_geometry_engine,
     )
+    detections_clean = prep["detections_clean"]
+    dedup_meta = prep["dedup_meta"]
+    n_det = int(prep["n_det_dedup"])
+    pitch_px = float(prep["pitch_final"])
+    pitch_method = str(prep["pitch_method"])
+    pitch_raw = float(prep["pitch_raw"])
+    pitch_filtered = float(prep["pitch_filtered"])
+    pitch_guard_triggered = bool(prep["pitch_guard_triggered"])
+    det_cleanup_clusters = list(prep["clusters"])
+
     match_thresh_px = float(max(6.0, ALPHA_MATCH * pitch_px))
     inlier_thresh_px = float(max(4.0, ALPHA_INLIER * pitch_px))
     topology_cfg.ransac_threshold = inlier_thresh_px
@@ -1103,7 +1725,7 @@ def _run_topology_refine_postprocess(
             source_tag=source_tag,
             used_fallback=used_fallback,
             min_topology_detections=min_topology_detections,
-            source_detections=source_detections,
+            source_detections=detections_clean,
             topology_cfg=topology_cfg,
             fit_success=False,
             transform_type="none",
@@ -1131,6 +1753,13 @@ def _run_topology_refine_postprocess(
             qc={
                 "source": source_tag,
                 "n_det": int(n_det),
+                "n_det_raw": int(n_det_raw),
+                "n_det_dedup": int(n_det),
+                "pitch_raw": None if not np.isfinite(pitch_raw) else float(pitch_raw),
+                "pitch_filtered": None if not np.isfinite(pitch_filtered) else float(pitch_filtered),
+                "pitch_final": float(pitch_px),
+                "pitch_guard_triggered": bool(pitch_guard_triggered),
+                "clusters": det_cleanup_clusters,
                 "fit_success": False,
                 "fit_success_raw": False,
             },
@@ -1140,7 +1769,7 @@ def _run_topology_refine_postprocess(
     fitter = TopologyFitter(topology_cfg)
     template_points = np.asarray(fitter.template, dtype=np.float32)[:12]
 
-    detected_centers = np.array([d.center for d in source_detections], dtype=np.float32)
+    detected_centers = np.array([d.center for d in detections_clean], dtype=np.float32)
     fitting_result = fitter.fit_and_fill(
         detected_centers=detected_centers,
         image_shape=raw_image.shape[:2],
@@ -1148,11 +1777,40 @@ def _run_topology_refine_postprocess(
     )
 
     fitted_centers = np.asarray(fitting_result.fitted_centers, dtype=np.float32)[:12]
-    match_map, match_dists, assignment_method = _match_template_to_detections_hungarian(
+    strict_match_map, strict_match_dists, strict_assignment_method = _match_template_to_detections_hungarian(
         fitted_centers=fitted_centers,
-        source_detections=source_detections,
+        source_detections=detections_clean,
         match_thresh_px=match_thresh_px,
     )
+    match_map = dict(strict_match_map)
+    match_dists = dict(strict_match_dists)
+    assignment_method = str(strict_assignment_method)
+    matched_count_strict = int(len(strict_match_map))
+    matched_count_relaxed = int(matched_count_strict)
+    relaxed_match_used = False
+    relaxed_assignment_method: Optional[str] = None
+    match_thresh_relaxed_px = float(max(
+        match_thresh_px,
+        float(POSTPROCESS_RECOVERY_CFG["relaxed_match_thresh_ratio"]) * pitch_px,
+    ))
+    match_thresh_used_px = float(match_thresh_px)
+    if (
+        n_det >= int(POSTPROCESS_RECOVERY_CFG["relaxed_match_min_det"])
+        and matched_count_strict < int(POSTPROCESS_RECOVERY_CFG["relaxed_match_trigger_count"])
+    ):
+        relaxed_map, relaxed_dists, relaxed_assignment_method = _match_template_to_detections_hungarian(
+            fitted_centers=fitted_centers,
+            source_detections=detections_clean,
+            match_thresh_px=match_thresh_relaxed_px,
+        )
+        matched_count_relaxed = int(len(relaxed_map))
+        if matched_count_relaxed > matched_count_strict:
+            match_map = dict(relaxed_map)
+            match_dists = dict(relaxed_dists)
+            assignment_method = f"{strict_assignment_method}+relaxed"
+            match_thresh_used_px = float(match_thresh_relaxed_px)
+            relaxed_match_used = True
+
     matched_count = int(len(match_map))
     pure_filled_count = int(max(0, 12 - matched_count))
     pure_filled_ratio = float(pure_filled_count / 12.0)
@@ -1167,15 +1825,25 @@ def _run_topology_refine_postprocess(
         np.ceil(min_topology_detections * 0.6)
     ))
 
+    reject_det_ratio_used = float(DET_REJECT_RATIO)
+    if relaxed_match_used:
+        reject_det_ratio_used = float(max(
+            reject_det_ratio_used,
+            float(POSTPROCESS_RECOVERY_CFG["relaxed_reject_det_ratio"]),
+        ))
+
     final_points_raw, point_source, det_fit_distance_px, final_stats = _build_final_points_det_priority(
         fitted_centers=fitted_centers,
-        source_detections=source_detections,
+        source_detections=detections_clean,
         match_map=match_map,
         pitch_px=pitch_px,
+        reject_det_ratio=reject_det_ratio_used,
     )
-    det_used_count = int(final_stats["det_used_count"])
-    fill_count = int(final_stats["fill_count"])
+    det_used_count = int(sum(1 for s in point_source if s in {"det", "det_mid"}))
+    fill_count = int(sum(1 for s in point_source if s == "filled"))
     reject_det_count = int(final_stats["reject_det_count"])
+    fill_ratio = float(fill_count / max(1, len(point_source)))
+    used_real_points = int(det_used_count)
 
     rotation_deg, scale = _compute_rotation_scale_from_matrix(fitting_result.transform_matrix)
     coverage_arms_raw = _compute_coverage_arms(fitting_result.detected_mask)
@@ -1187,33 +1855,99 @@ def _run_topology_refine_postprocess(
         template_points=template_points,
         canvas_size=effective_geometry_engine.config.canvas_size,
     )
-    transform_raw_to_canonical, transform_raw_to_canonical_type = _estimate_affine_raw_to_canonical(
+    transform_summary = _choose_transform_model(
         raw_points=final_points_raw,
         canonical_points=canonical_points,
+        point_sources=point_source,
     )
+    transform_raw_to_canonical = transform_summary.get("matrix")
+    transform_raw_to_canonical_type = str(transform_summary.get("model_chosen", "none"))
+    transform_score_sim = float(transform_summary.get("score_sim", float("inf")))
+    transform_score_affine = float(transform_summary.get("score_affine", float("inf")))
+    transform_score_h = float(transform_summary.get("score_h", float("inf")))
+    transform_inliers_sim = int(transform_summary.get("inliers_count_sim", 0))
+    transform_inliers_affine = int(transform_summary.get("inliers_count_affine", 0))
+    transform_inliers_h = int(transform_summary.get("inliers_count_h", 0))
+    transform_reproj_median = float(transform_summary.get("reproj_median", float("inf")))
+    transform_reproj_mean = float(transform_summary.get("reproj_mean", float("inf")))
+    transform_reproj_max = float(transform_summary.get("reproj_max", float("inf")))
+    transform_real_indices = [int(i) for i in transform_summary.get("real_indices", [])]
+    transform_used_filled_points = int(transform_summary.get("used_filled_points_for_transform", 0))
 
     # raw -> canonical 一致性检查（用于证明几何对齐与模板一致）
+    reproj_median_px = float("inf")
     reproj_mean_px = float("inf")
     reproj_max_px = float("inf")
     projected_raw = final_points_raw.copy()
     canonical_warp: Optional[np.ndarray] = None
     if transform_raw_to_canonical is not None:
-        inv_m = cv2.invertAffineTransform(transform_raw_to_canonical.astype(np.float32))
-        ones = np.ones((canonical_points.shape[0], 1), dtype=np.float32)
-        canonical_h = np.hstack([canonical_points.astype(np.float32), ones])
-        projected_raw = (inv_m @ canonical_h.T).T
+        model = str(transform_raw_to_canonical_type)
+        if model == "homography":
+            H = np.asarray(transform_raw_to_canonical, dtype=np.float32)
+            canonical_warp = cv2.warpPerspective(
+                raw_image,
+                H,
+                (effective_geometry_engine.config.canvas_size, effective_geometry_engine.config.canvas_size),
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+            try:
+                H_inv = np.linalg.inv(H)
+                projected_raw = _apply_transform_points(canonical_points, H_inv, "homography")
+            except Exception:
+                projected_raw = final_points_raw.copy()
+        else:
+            M = np.asarray(transform_raw_to_canonical, dtype=np.float32)
+            canonical_warp = cv2.warpAffine(
+                raw_image,
+                M,
+                (effective_geometry_engine.config.canvas_size, effective_geometry_engine.config.canvas_size),
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+            inv_m = cv2.invertAffineTransform(M)
+            ones = np.ones((canonical_points.shape[0], 1), dtype=np.float32)
+            canonical_h = np.hstack([canonical_points.astype(np.float32), ones])
+            projected_raw = (inv_m @ canonical_h.T).T
         reproj = np.linalg.norm(projected_raw - final_points_raw.astype(np.float32), axis=1)
+        reproj_median_px = float(np.median(reproj))
         reproj_mean_px = float(np.mean(reproj))
         reproj_max_px = float(np.max(reproj))
-        canonical_warp = cv2.warpAffine(
-            raw_image,
-            transform_raw_to_canonical.astype(np.float32),
-            (effective_geometry_engine.config.canvas_size, effective_geometry_engine.config.canvas_size),
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
+    if np.isfinite(transform_reproj_median):
+        reproj_median_px = float(transform_reproj_median)
+    if np.isfinite(transform_reproj_mean):
+        reproj_mean_px = float(transform_reproj_mean)
+    if np.isfinite(transform_reproj_max):
+        reproj_max_px = float(transform_reproj_max)
+
+    indexed_points: List[Dict[str, Any]] = []
+    for idx in range(min(12, final_points_raw.shape[0])):
+        det_idx = int(match_map[idx]) if idx in match_map else -1
+        cluster_id = None
+        ref_det_id = None
+        if 0 <= det_idx < len(dedup_meta):
+            cluster_id = int(dedup_meta[det_idx]["cluster_id"])
+            ref_det_id = int(dedup_meta[det_idx]["representative_idx"])
+        indexed_points.append(
+            {
+                "chamber_index": int(idx),
+                "chamber_id": str(template_ids[idx]) if idx < len(template_ids) else str(idx),
+                "xy": [float(final_points_raw[idx, 0]), float(final_points_raw[idx, 1])],
+                "source": str(point_source[idx]) if idx < len(point_source) else "filled",
+                "det_id": None if det_idx < 0 else int(det_idx),
+                "cluster_id": cluster_id,
+                "ref_det_id": ref_det_id,
+            }
         )
 
-    topo_user_cfg = config.topology or TopologyConfig()
+    geometry_suspect = bool(
+        (np.isfinite(reproj_median_px) and reproj_median_px > float(POSTPROCESS_RECOVERY_CFG["fallback_reproj_ratio"]) * pitch_px)
+        or used_real_points < int(POSTPROCESS_RECOVERY_CFG["fallback_min_real_points"])
+        or fill_ratio > float(POSTPROCESS_RECOVERY_CFG["fallback_max_fill_ratio"])
+        or relaxed_match_used
+    )
+    slice_mode = "det_fallback" if geometry_suspect else "canonical"
+
     blank_mode = str(getattr(topo_user_cfg, "blank_mode", "chromaticity")).strip().lower()
     if blank_mode == "color_v2":
         blank_mode = "chromaticity"
@@ -1239,6 +1973,12 @@ def _run_topology_refine_postprocess(
         if blank_candidate_indices
         else list(OUTERMOST_TEMPLATE_INDICES)
     )
+    candidate_indices = [
+        int(i) for i in candidate_indices
+        if int(i) in set(OUTERMOST_TEMPLATE_INDICES) and 0 <= int(i) < 12
+    ]
+    if not candidate_indices:
+        candidate_indices = list(OUTERMOST_TEMPLATE_INDICES)
 
     blank_indices: List[int] = []
     blank_scores: Dict[int, float] = {}
@@ -1510,10 +2250,24 @@ def _run_topology_refine_postprocess(
         if not blank_indices:
             blank_fail_reasons.append("blank_candidates_insufficient")
 
+    forced_blank_idx, allowed_blank_candidates, forced_blank_is_outer = _select_blank_with_outermost_constraint(
+        blank_indices=blank_indices,
+        blank_scores=blank_scores,
+        reference_arm=reference_arm_pred if reference_arm_pred is not None else reference_arm,
+        template_ids=template_ids,
+        candidate_indices=candidate_indices,
+    )
+    blank_indices = [int(forced_blank_idx)] if forced_blank_idx is not None else []
+    blank_is_outermost = bool(forced_blank_is_outer)
+    if forced_blank_idx is None:
+        blank_fail_reasons.append("blank_outermost_unresolved")
+    if forced_blank_idx is not None and forced_blank_idx not in allowed_blank_candidates:
+        blank_fail_reasons.append("blank_not_in_allowed_outermost_candidates")
+
     reproj_thresh = float(POST_QC_MAX_GEOMETRY_REPROJ_RATIO * pitch_px)
     blank_idx = int(blank_indices[0]) if blank_indices else None
     blank_source = point_source[blank_idx] if blank_idx is not None and blank_idx < len(point_source) else "none"
-    blank_from_non_det = blank_source in ("fill", "fit_reject_det")
+    blank_from_non_det = blank_source not in ("det", "det_mid")
     blank_spread_gate = float(
         selected_blank_margin_thr
         if blank_mode in {"color", "chromaticity"}
@@ -1558,13 +2312,16 @@ def _run_topology_refine_postprocess(
     blank_margin_pred = float(blank_score_spread)
     blank_unresolved = bool(blank_status == "unresolved")
     blank_is_outermost = bool(blank_idx in OUTERMOST_TEMPLATE_INDICES) if blank_idx is not None else False
+    blank_valid = bool(blank_idx is not None and blank_is_outermost)
+    if blank_idx is not None and not blank_is_outermost:
+        blank_fail_reasons.append("blank_not_outermost")
     if reference_arm_pred is None:
         reference_arm_pred = reference_arm
     if reference_arm_pred is None and blank_idx is not None:
         reference_arm_pred = ["Up", "Right", "Down", "Left"][max(0, min(3, int(blank_idx) // 3))]
     reference_arm = reference_arm_pred
 
-    fit_success_qc = bool(
+    topology_success_geo = bool(
         fitting_result.fit_success
         and n_inliers >= int(topology_cfg.min_inliers)
         and np.isfinite(rmse_px)
@@ -1573,44 +2330,60 @@ def _run_topology_refine_postprocess(
         and matched_count >= min_matched_count
         and matched_coverage_arms >= POST_QC_MIN_MATCHED_COVERAGE_ARMS
         and pure_filled_ratio <= POST_QC_MAX_PURE_FILLED_RATIO
+        and transform_raw_to_canonical is not None
+        and transform_raw_to_canonical_type in {"similarity", "affine", "homography"}
+    )
+    semantic_ready = bool(
+        reference_arm_pred is not None
+        and blank_id_pred is not None
         and blank_confidence >= POST_QC_MIN_BLANK_CONFIDENCE
         and blank_score_spread >= blank_spread_gate
         and blank_status != "unresolved"
-        and np.isfinite(reproj_mean_px)
-        and reproj_mean_px <= reproj_thresh
+        and blank_valid
         and (blank_is_detected if POST_QC_REQUIRE_BLANK_DETECTED else True)
     )
+    fit_success_qc = bool(topology_success_geo)
 
-    qc_fail_reasons: List[str] = []
+    qc_fail_reasons_geo: List[str] = []
     if not fitting_result.fit_success:
-        qc_fail_reasons.append("fit_success_raw=false")
+        qc_fail_reasons_geo.append("fit_success_raw=false")
     if n_inliers < int(topology_cfg.min_inliers):
-        qc_fail_reasons.append(f"n_inliers<{int(topology_cfg.min_inliers)}")
+        qc_fail_reasons_geo.append(f"n_inliers<{int(topology_cfg.min_inliers)}")
     if not np.isfinite(rmse_px):
-        qc_fail_reasons.append("rmse_non_finite")
+        qc_fail_reasons_geo.append("rmse_non_finite")
     if coverage_arms < 0.25:
-        qc_fail_reasons.append("coverage_arms<0.25")
+        qc_fail_reasons_geo.append("coverage_arms<0.25")
     if scale <= 0.0:
-        qc_fail_reasons.append("scale<=0")
+        qc_fail_reasons_geo.append("scale<=0")
     if matched_count < min_matched_count:
-        qc_fail_reasons.append(f"matched_count<{min_matched_count}")
+        qc_fail_reasons_geo.append(f"matched_count<{min_matched_count}")
     if matched_coverage_arms < POST_QC_MIN_MATCHED_COVERAGE_ARMS:
-        qc_fail_reasons.append(f"matched_coverage_arms<{POST_QC_MIN_MATCHED_COVERAGE_ARMS:.2f}")
+        qc_fail_reasons_geo.append(f"matched_coverage_arms<{POST_QC_MIN_MATCHED_COVERAGE_ARMS:.2f}")
     if pure_filled_ratio > POST_QC_MAX_PURE_FILLED_RATIO:
-        qc_fail_reasons.append(f"pure_filled_ratio>{POST_QC_MAX_PURE_FILLED_RATIO:.2f}")
+        qc_fail_reasons_geo.append(f"pure_filled_ratio>{POST_QC_MAX_PURE_FILLED_RATIO:.2f}")
+    if transform_raw_to_canonical is None:
+        qc_fail_reasons_geo.append("transform_unavailable")
+    if transform_raw_to_canonical_type not in {"similarity", "affine", "homography"}:
+        qc_fail_reasons_geo.append("transform_model_invalid")
+    semantic_fail_reasons: List[str] = []
+    if reference_arm_pred is None:
+        semantic_fail_reasons.append("reference_arm_unresolved")
+    if blank_id_pred is None:
+        semantic_fail_reasons.append("blank_id_unresolved")
     if blank_confidence < POST_QC_MIN_BLANK_CONFIDENCE:
-        qc_fail_reasons.append(f"blank_confidence<{POST_QC_MIN_BLANK_CONFIDENCE:.3f}")
+        semantic_fail_reasons.append(f"blank_confidence<{POST_QC_MIN_BLANK_CONFIDENCE:.3f}")
     if blank_score_spread < blank_spread_gate:
-        qc_fail_reasons.append(f"blank_score_spread<{blank_spread_gate:.3f}")
+        semantic_fail_reasons.append(f"blank_score_spread<{blank_spread_gate:.3f}")
     if blank_status == "unresolved":
-        qc_fail_reasons.append("blank_unresolved")
-        qc_fail_reasons.extend(blank_fail_reasons)
-    if not np.isfinite(reproj_mean_px):
-        qc_fail_reasons.append("geometry_reprojection_non_finite")
-    elif reproj_mean_px > reproj_thresh:
-        qc_fail_reasons.append(f"geometry_reprojection_mean>{reproj_thresh:.2f}")
+        semantic_fail_reasons.append("blank_unresolved")
+        semantic_fail_reasons.extend(blank_fail_reasons)
+    if not blank_valid:
+        semantic_fail_reasons.append("blank_invalid")
     if POST_QC_REQUIRE_BLANK_DETECTED and not blank_is_detected:
-        qc_fail_reasons.append("blank_not_detected")
+        semantic_fail_reasons.append("blank_not_detected")
+    qc_fail_reasons: List[str] = []
+    qc_fail_reasons.extend(qc_fail_reasons_geo)
+    qc_fail_reasons.extend(semantic_fail_reasons)
 
     blank_idx = int(blank_indices[0]) if blank_indices else None
     (
@@ -1621,11 +2394,18 @@ def _run_topology_refine_postprocess(
 
     qc: Dict[str, Any] = {
         "source": source_tag,
+        "used_fallback": bool(used_fallback),
+        "n_det_raw": int(n_det_raw),
+        "n_det_dedup": int(n_det),
+        "clusters": det_cleanup_clusters,
         "n_det": int(n_det),
         "n_inliers": int(n_inliers),
         "n_filled": int(pure_filled_count),
         "pure_filled_count": int(pure_filled_count),
         "pure_filled_ratio": float(pure_filled_ratio),
+        "fill_ratio": float(fill_ratio),
+        "used_real_points": int(used_real_points),
+        "indexed_points": indexed_points,
         "matched_count": int(matched_count),
         "det_used_count": int(det_used_count),
         "fill_count": int(fill_count),
@@ -1634,6 +2414,17 @@ def _run_topology_refine_postprocess(
         "det_fit_dist_max_px": final_stats.get("det_fit_dist_max_px"),
         "keep_det_thr_px": final_stats.get("keep_det_thr_px"),
         "reject_det_thr_px": final_stats.get("reject_det_thr_px"),
+        "reject_det_ratio_used": float(reject_det_ratio_used),
+        "matched_count_strict": int(matched_count_strict),
+        "matched_count_relaxed": int(matched_count_relaxed),
+        "relaxed_match_used": bool(relaxed_match_used),
+        "match_thresh_strict_px": float(match_thresh_px),
+        "match_thresh_used_px": float(match_thresh_used_px),
+        "match_thresh_relaxed_px": float(match_thresh_relaxed_px),
+        "assignment_method_strict": str(strict_assignment_method),
+        "assignment_method_relaxed": (
+            None if relaxed_assignment_method is None else str(relaxed_assignment_method)
+        ),
         "matched_count_per_arm": matched_count_per_arm,
         "matched_coverage_arms": float(matched_coverage_arms),
         "blank_is_detected": bool(blank_is_detected),
@@ -1664,6 +2455,23 @@ def _run_topology_refine_postprocess(
         "blank_score": float(blank_score_pred) if np.isfinite(blank_score_pred) else None,
         "blank_unresolved": bool(blank_unresolved),
         "blank_is_outermost": bool(blank_is_outermost),
+        "blank_valid": bool(blank_valid),
+        "blank_selected": (
+            str(template_ids[blank_id_pred]) if blank_id_pred is not None and 0 <= int(blank_id_pred) < len(template_ids)
+            else None
+        ),
+        "blank_selected_index": (None if blank_id_pred is None else int(blank_id_pred)),
+        "blank_candidates": [
+            str(template_ids[idx]) if 0 <= int(idx) < len(template_ids) else str(int(idx))
+            for idx in allowed_blank_candidates
+        ],
+        "blank_candidate_indices": [int(i) for i in allowed_blank_candidates],
+        "success_mode": success_mode,
+        "export_geo_even_if_blank_unresolved": bool(export_geo),
+        "topology_success_geo": bool(topology_success_geo),
+        "semantic_ready": bool(semantic_ready),
+        "blank_pass": bool(semantic_ready),
+        "geo_success": bool(topology_success_geo),
         "reference_arm": reference_arm,
         "reference_arm_pred": reference_arm_pred,
         "arm_scores": {str(k): float(v) for k, v in arm_scores.items()},
@@ -1690,11 +2498,30 @@ def _run_topology_refine_postprocess(
         "coverage_arms_raw": float(coverage_arms_raw),
         "scale": float(scale),
         "rotation": float(rotation_deg),
-        "transform_type": str(fitting_result.transform_type),
+        "transform_type": str(transform_raw_to_canonical_type),
+        "topology_fit_transform_type": str(fitting_result.transform_type),
         "canonical_transform_type": str(transform_raw_to_canonical_type),
+        "model_chosen": str(transform_raw_to_canonical_type),
+        "score_sim": float(transform_score_sim) if np.isfinite(transform_score_sim) else None,
+        "score_affine": float(transform_score_affine) if np.isfinite(transform_score_affine) else None,
+        "score_h": float(transform_score_h) if np.isfinite(transform_score_h) else None,
+        "inliers_count_sim": int(transform_inliers_sim),
+        "inliers_count_affine": int(transform_inliers_affine),
+        "inliers_count_h": int(transform_inliers_h),
+        "transform_real_indices": transform_real_indices,
+        "transform_used_filled_points": int(transform_used_filled_points),
+        "reproj_median": float(reproj_median_px) if np.isfinite(reproj_median_px) else None,
+        "reproj_mean": float(reproj_mean_px) if np.isfinite(reproj_mean_px) else None,
+        "reproj_max": float(reproj_max_px) if np.isfinite(reproj_max_px) else None,
+        "geometry_suspect": bool(geometry_suspect),
+        "slice_mode": str(slice_mode),
         "pitch_px": float(pitch_px),
+        "pitch_raw": float(pitch_raw) if np.isfinite(pitch_raw) else None,
+        "pitch_filtered": float(pitch_filtered) if np.isfinite(pitch_filtered) else None,
+        "pitch_final": float(pitch_px),
+        "pitch_guard_triggered": bool(pitch_guard_triggered),
         "pitch_estimation_method": str(pitch_method),
-        "match_thresh_px": float(match_thresh_px),
+        "match_thresh_px": float(match_thresh_used_px),
         "inlier_thresh_px": float(inlier_thresh_px),
         "assignment_method": str(assignment_method),
         "blank_scores": {str(k): float(v) for k, v in blank_scores.items()},
@@ -1709,13 +2536,16 @@ def _run_topology_refine_postprocess(
         "template_ids": template_ids,
         "semantic_roles_by_template": semantic_roles_by_template,
         "semantic_arm_role_by_template": semantic_arm_role_by_template,
-        "blank_candidate_indices": blank_candidate_indices,
+        "blank_candidate_indices_raw": blank_candidate_indices,
         "reprojection_error_mean_px": float(reproj_mean_px) if np.isfinite(reproj_mean_px) else None,
         "reprojection_error_max_px": float(reproj_max_px) if np.isfinite(reproj_max_px) else None,
+        "reprojection_error_median_px": float(reproj_median_px) if np.isfinite(reproj_median_px) else None,
         "reprojection_error_threshold_px": float(reproj_thresh),
         "semantic_order_clockwise_from_blank": semantic_order_clockwise_from_blank,
         "fit_success_raw": bool(fitting_result.fit_success),
         "fit_success": bool(fit_success_qc),
+        "qc_fail_reasons_geo": qc_fail_reasons_geo,
+        "semantic_fail_reasons": semantic_fail_reasons,
         "qc_fail_reasons": qc_fail_reasons,
     }
 
@@ -1727,13 +2557,13 @@ def _run_topology_refine_postprocess(
         source_tag=source_tag,
         used_fallback=used_fallback,
         min_topology_detections=min_topology_detections,
-        source_detections=source_detections,
+        source_detections=detections_clean,
         topology_cfg=topology_cfg,
         fit_success=fit_success_qc,
-        transform_type=str(fitting_result.transform_type),
+        transform_type=str(transform_raw_to_canonical_type),
         pitch_px=pitch_px,
         pitch_estimation_method=pitch_method,
-        match_thresh_px=match_thresh_px,
+        match_thresh_px=match_thresh_used_px,
         inlier_thresh_px=inlier_thresh_px,
         assignment_method=assignment_method,
         n_inliers=n_inliers,
@@ -1755,7 +2585,7 @@ def _run_topology_refine_postprocess(
         blank_status=blank_status,
         blank_features=blank_features,
         blank_score_spread=blank_score_spread,
-        blank_candidate_indices=blank_candidate_indices,
+        blank_candidate_indices=allowed_blank_candidates,
         blank_mode=blank_mode_selected,
         blank_id_old=blank_id_old,
         blank_id_color=blank_id_color,
@@ -1796,7 +2626,7 @@ def _run_topology_refine_postprocess(
         debug_payload["status"] = "failed"
         debug_payload["failure_reason"] = reason
         raise TopologyPostprocessError(reason, debug_payload=debug_payload)
-    if blank_status == "unresolved" or not blank_indices:
+    if (blank_status == "unresolved" or not blank_indices) and (not export_geo):
         reason = (
             "postprocess_qc_failed: blank_unresolved "
             f"(n_det={n_det}, coverage_arms={coverage_arms:.2f}, reasons={blank_fail_reasons})"
@@ -1806,7 +2636,7 @@ def _run_topology_refine_postprocess(
         raise TopologyPostprocessError(reason, debug_payload=debug_payload)
 
     adaptive_result = AdaptiveDetectionResult(
-        detections=source_detections,
+        detections=detections_clean,
         roi_bbox=(0, 0, int(raw_image.shape[1]), int(raw_image.shape[0])),
         cluster_score=0.0,
         is_fallback=(source_tag != "json"),
@@ -1865,11 +2695,38 @@ def _run_topology_refine_postprocess(
         "blank_score_method": score_method,
         "blank_score_weights": score_weights,
         "template_ids": template_ids,
-        "blank_candidate_indices": blank_candidate_indices,
+        "blank_candidate_indices": [int(i) for i in allowed_blank_candidates],
         "semantic_order_clockwise_from_blank": semantic_order_clockwise_from_blank,
         "semantic_roles_by_template": semantic_roles_by_template,
         "semantic_arm_role_by_template": semantic_arm_role_by_template,
-        "transform_raw_to_canonical": transform_raw_to_canonical.tolist() if transform_raw_to_canonical is not None else None,
+        "transform_raw_to_canonical": (
+            np.asarray(transform_raw_to_canonical).tolist()
+            if transform_raw_to_canonical is not None
+            else None
+        ),
+        "transform_model_chosen": str(transform_raw_to_canonical_type),
+        "score_sim": float(transform_score_sim) if np.isfinite(transform_score_sim) else None,
+        "score_affine": float(transform_score_affine) if np.isfinite(transform_score_affine) else None,
+        "score_h": float(transform_score_h) if np.isfinite(transform_score_h) else None,
+        "inliers_count_sim": int(transform_inliers_sim),
+        "inliers_count_affine": int(transform_inliers_affine),
+        "inliers_count_h": int(transform_inliers_h),
+        "reproj_median": float(reproj_median_px) if np.isfinite(reproj_median_px) else None,
+        "reproj_mean": float(reproj_mean_px) if np.isfinite(reproj_mean_px) else None,
+        "reproj_max": float(reproj_max_px) if np.isfinite(reproj_max_px) else None,
+        "slice_mode": str(slice_mode),
+        "geometry_suspect": bool(geometry_suspect),
+        "pitch_final": float(pitch_px),
+        "det_cleanup_clusters": det_cleanup_clusters,
+        "indexed_points": indexed_points,
+        "dedup_meta": dedup_meta,
+        "det_fallback_crop_radius_px": float(
+            np.clip(
+                POSTPROCESS_RECOVERY_CFG["fallback_crop_radius_ratio"] * pitch_px,
+                POSTPROCESS_RECOVERY_CFG["fallback_crop_radius_min_px"],
+                POSTPROCESS_RECOVERY_CFG["fallback_crop_radius_max_px"],
+            )
+        ),
     }
     return geometry_detections, qc, debug_payload, canonical_context
 
@@ -1984,36 +2841,35 @@ def _estimate_pitch_px(
     geometry_engine: CrossGeometryEngine
 ) -> Tuple[float, str]:
     """
-    基于检测点估计 pitch（点间距），用于自适应阈值。
+    基于检测点估计 pitch（鲁棒 kNN 版本），用于自适应阈值。
     """
-    pts = np.array([d.center for d in source_detections], dtype=np.float32) if source_detections else np.empty((0, 2), dtype=np.float32)
+    pts = (
+        np.array([d.center for d in source_detections], dtype=np.float32)
+        if source_detections
+        else np.empty((0, 2), dtype=np.float32)
+    )
+    robust = _estimate_pitch_robust_from_points(pts)
+    pitch = float(robust.get("pitch_filtered", float("nan")))
+    if not np.isfinite(pitch):
+        pitch = float(robust.get("pitch_raw", float("nan")))
+    if np.isfinite(pitch):
+        pitch_clamped = float(np.clip(
+            pitch,
+            float(POSTPROCESS_RECOVERY_CFG["pitch_min_px"]),
+            float(POSTPROCESS_RECOVERY_CFG["pitch_max_px"]),
+        ))
+        return pitch_clamped, "knn3_filtered"
 
-    # 方法1：检测点最近邻中位数（首选）
-    if pts.shape[0] >= 4:
-        dmat = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
-        np.fill_diagonal(dmat, np.inf)
-        nn = np.min(dmat, axis=1)
-        nn = nn[np.isfinite(nn)]
-        if nn.size > 0:
-            pitch = float(np.median(nn))
-            if np.isfinite(pitch) and pitch > 1.0:
-                return pitch, "nn_median_k1"
-
-    # 方法2：ROI 尺寸估计（十字模板约 6*pitch 跨度）
-    if isinstance(roi_bbox, (list, tuple)) and len(roi_bbox) == 4:
-        try:
-            x1, y1, x2, y2 = [float(v) for v in roi_bbox]
-            rw = max(1.0, x2 - x1)
-            rh = max(1.0, y2 - y1)
-            pitch = float(min(rw, rh) / 6.0)
-            if np.isfinite(pitch) and pitch > 1.0:
-                return pitch, "roi_extent_over_6"
-        except Exception:
-            pass
-
-    # 方法3：几何先验回退
-    fallback = float(max(8.0, geometry_engine.config.ideal_chamber_step))
-    return fallback, "geometry_step_fallback"
+    fallback, method = _estimate_pitch_from_roi_or_fallback(
+        roi_bbox=roi_bbox,
+        geometry_engine=geometry_engine,
+    )
+    fallback = float(np.clip(
+        fallback,
+        float(POSTPROCESS_RECOVERY_CFG["pitch_min_px"]),
+        float(POSTPROCESS_RECOVERY_CFG["pitch_max_px"]),
+    ))
+    return fallback, method
 
 
 def _match_template_to_detections_hungarian(
@@ -2151,6 +3007,9 @@ def _write_blank_features_debug(run_dir: Path, payload: Dict[str, Any]) -> None:
             "blank_score_spread": blank.get("blank_score_spread"),
             "blank_unresolved": blank.get("blank_unresolved"),
             "blank_is_outermost": blank.get("blank_is_outermost"),
+            "blank_valid": blank.get("blank_valid"),
+            "blank_selected": blank.get("blank_selected"),
+            "blank_selected_index": blank.get("blank_selected_index"),
             "reference_arm_pred": blank.get("reference_arm_pred", blank.get("reference_arm")),
             "reference_arm": blank.get("reference_arm"),
             "arm_margin": blank.get("arm_margin"),
@@ -2280,12 +3139,12 @@ def _build_fitted_point_debug(
             pure_filled_count += 1
             p_det = None
 
-        source = point_sources[idx] if idx < len(point_sources) else ("det" if detected_by_model else "fill")
+        source = point_sources[idx] if idx < len(point_sources) else ("det" if detected_by_model else "filled")
         if source in ("det", "det_mid"):
             det_used_count += 1
-        elif source == "fit_reject_det":
+        elif source == "filled" and detected_by_model:
             reject_det_count += 1
-        elif source == "fill":
+        elif source == "filled":
             fill_count += 1
 
         det_fit_distance = (
@@ -2576,6 +3435,71 @@ def _build_topology_attempt_debug_payload(
             "detection_params": detection_params or {},
         },
         "n_det": int(len(source_detections)),
+        "n_det_raw": (
+            int(qc.get("n_det_raw"))
+            if isinstance(qc, dict) and qc.get("n_det_raw") is not None
+            else int(len(source_detections))
+        ),
+        "n_det_dedup": (
+            int(qc.get("n_det_dedup"))
+            if isinstance(qc, dict) and qc.get("n_det_dedup") is not None
+            else int(len(source_detections))
+        ),
+        "clusters": (
+            list(qc.get("clusters", []))
+            if isinstance(qc, dict)
+            else []
+        ),
+        "pitch_final": (
+            float(qc.get("pitch_final"))
+            if isinstance(qc, dict) and qc.get("pitch_final") is not None
+            else (float(pitch_px) if pitch_px is not None else None)
+        ),
+        "pitch_guard_triggered": (
+            bool(qc.get("pitch_guard_triggered"))
+            if isinstance(qc, dict)
+            else False
+        ),
+        "fill_ratio": (
+            float(qc.get("fill_ratio"))
+            if isinstance(qc, dict) and qc.get("fill_ratio") is not None
+            else None
+        ),
+        "used_real_points": (
+            int(qc.get("used_real_points"))
+            if isinstance(qc, dict) and qc.get("used_real_points") is not None
+            else None
+        ),
+        "model_chosen": (
+            str(qc.get("model_chosen"))
+            if isinstance(qc, dict) and qc.get("model_chosen") is not None
+            else str(transform_type)
+        ),
+        "reproj_median": (
+            float(qc.get("reproj_median"))
+            if isinstance(qc, dict) and qc.get("reproj_median") is not None
+            else None
+        ),
+        "reproj_mean": (
+            float(qc.get("reproj_mean"))
+            if isinstance(qc, dict) and qc.get("reproj_mean") is not None
+            else None
+        ),
+        "geometry_suspect": (
+            bool(qc.get("geometry_suspect"))
+            if isinstance(qc, dict)
+            else False
+        ),
+        "slice_mode": (
+            str(qc.get("slice_mode"))
+            if isinstance(qc, dict) and qc.get("slice_mode") is not None
+            else "canonical"
+        ),
+        "indexed_points": (
+            list(qc.get("indexed_points", []))
+            if isinstance(qc, dict)
+            else []
+        ),
         "detections": detections_payload,
         "inlier_det_indices": [int(i) for i in (inlier_indices or [])],
         "fit": fit_block,
@@ -2616,6 +3540,13 @@ def _build_topology_attempt_debug_payload(
             "blank_score": blank_score,
             "blank_unresolved": blank_unresolved,
             "blank_is_outermost": bool(blank_is_outermost),
+            "blank_valid": bool((blank_id_pred is not None) and blank_is_outermost and (blank_status_pred != "unresolved")),
+            "blank_selected": (
+                str(template_ids[int(blank_id_pred)])
+                if isinstance(template_ids, list) and blank_id_pred is not None and 0 <= int(blank_id_pred) < len(template_ids)
+                else None
+            ),
+            "blank_selected_index": None if blank_id_pred is None else int(blank_id_pred),
             "reference_arm": reference_arm,
             "reference_arm_pred": reference_arm_pred or reference_arm,
             "arm_scores": arm_scores_payload,
@@ -3420,7 +4351,8 @@ def run_stage1_postprocess_from_json(
     enable_fallback_detection: bool = True,
     geometry_engine: Optional[CrossGeometryEngine] = None,
     save_individual_slices: bool = False,
-    save_debug: bool = True
+    save_debug: bool = True,
+    export_geo_even_if_blank_unresolved: Optional[bool] = None,
 ) -> Stage1Output:
     """
     仅执行 Stage1 后处理（几何校正 + 切片），检测结果从 JSON 读取。
@@ -3486,7 +4418,8 @@ def run_stage1_postprocess_from_json(
             used_fallback=False,
             roi_bbox=json_roi_bbox,
             detection_params=json_detection_params,
-            geometry_engine=effective_geometry_engine
+            geometry_engine=effective_geometry_engine,
+            export_geo_even_if_blank_unresolved=export_geo_even_if_blank_unresolved,
         )
         debug_dump_topology(run_dir, raw_image, attempt_payload, suffix="_try1")
         attempts.append(attempt_payload)
@@ -3516,11 +4449,14 @@ def run_stage1_postprocess_from_json(
         debug_dump_topology(run_dir, raw_image, first_payload, suffix="_try1")
         attempts.append(first_payload)
 
-        if not enable_fallback_detection:
+        first_bucket = _classify_postprocess_failure_bucket(str(first_err))
+        allow_fallback_for_bucket = first_bucket in {"fail_n_det_lt_min", "fail_topology_fit"}
+        if (not enable_fallback_detection) or (not allow_fallback_for_bucket):
             final_payload = dict(first_payload)
             final_payload["used_fallback"] = False
             final_payload["final_status"] = "failed"
             final_payload["final_reason"] = str(first_err)
+            final_payload["fail_bucket"] = first_bucket
             final_payload["attempts"] = attempts
             final_payload["selected_attempt_id"] = "try1_json"
             final_paths = debug_dump_topology(run_dir, raw_image, final_payload, suffix=None)
@@ -3585,7 +4521,8 @@ def run_stage1_postprocess_from_json(
                 used_fallback=True,
                 roi_bbox=fallback_cluster.roi_bbox,
                 detection_params=fallback_detection_params,
-                geometry_engine=effective_geometry_engine
+                geometry_engine=effective_geometry_engine,
+                export_geo_even_if_blank_unresolved=export_geo_even_if_blank_unresolved,
             )
             second_payload["fallback_reason"] = str(first_err)
             debug_dump_topology(run_dir, raw_image, second_payload, suffix="_try2")
@@ -3623,6 +4560,7 @@ def run_stage1_postprocess_from_json(
             final_payload["used_fallback"] = True
             final_payload["final_status"] = "failed"
             final_payload["final_reason"] = str(second_err)
+            final_payload["fail_bucket"] = _classify_postprocess_failure_bucket(str(second_err))
             final_payload["attempts"] = attempts
             final_payload["selected_attempt_id"] = "try2_fallback"
             final_paths = debug_dump_topology(run_dir, raw_image, final_payload, suffix=None)
@@ -3639,8 +4577,14 @@ def run_stage1_postprocess_from_json(
             "input_detection_count": int(len(detections_from_json)),
             "selected_detection_count": int(len(selected_geometry_detections)),
             "min_topology_detections": int(min_required),
+            "used_fallback": bool(selected_source != "json"),
         }
     )
+    semantic_ready = bool(selected_qc.get("semantic_ready", False))
+    selected_qc["semantic_ready"] = semantic_ready
+    selected_qc["blank_pass"] = semantic_ready
+    selected_qc["geo_success"] = False
+    selected_qc["usable_for_stage2"] = False
     if selected_source != "json":
         selected_qc["fallback_reason"] = attempts[0].get("failure_reason") if attempts else None
 
@@ -3686,18 +4630,86 @@ def run_stage1_postprocess_from_json(
     reproj_mean = geom_debug.get("reprojection_error_mean_px")
     reproj_max = geom_debug.get("reprojection_error_max_px")
     center_offset_max = geom_debug.get("slice_center_offset_max_px")
-    reproj_limit = float(POST_QC_MAX_GEOMETRY_REPROJ_RATIO * float(selected_qc.get("pitch_px", 50.0)))
-    geometry_fail_reasons: List[str] = []
-    if reproj_mean is None or not np.isfinite(float(reproj_mean)):
-        geometry_fail_reasons.append("geometry_reprojection_missing")
-    elif float(reproj_mean) > reproj_limit:
-        geometry_fail_reasons.append(f"geometry_reprojection_mean>{reproj_limit:.2f}")
-    if center_offset_max is None or not np.isfinite(float(center_offset_max)):
-        geometry_fail_reasons.append("slice_center_offset_missing")
-    elif float(center_offset_max) > POST_QC_MAX_SLICE_CENTER_OFFSET_PX:
-        geometry_fail_reasons.append(
-            f"slice_center_offset_max>{POST_QC_MAX_SLICE_CENTER_OFFSET_PX:.1f}"
-        )
+    slice_mode = str(selected_qc.get("slice_mode", selected_canonical_context.get("slice_mode", "canonical")))
+    geometry_suspect = bool(selected_qc.get("geometry_suspect", False))
+    soft_reproj_limit = float(POST_QC_MAX_GEOMETRY_REPROJ_RATIO * float(selected_qc.get("pitch_px", 50.0)))
+    hard_reproj_limit = float(POST_QC_HARD_GEOMETRY_REPROJ_RATIO * float(selected_qc.get("pitch_px", 50.0)))
+    soft_offset_limit = float(POST_QC_MAX_SLICE_CENTER_OFFSET_PX)
+    hard_offset_limit = float(POST_QC_HARD_SLICE_CENTER_OFFSET_PX)
+    hard_fail_reasons: List[str] = []
+    soft_warn_reasons: List[str] = []
+    if slice_mode == "det_fallback":
+        soft_warn_reasons.append("slice_mode=det_fallback")
+        if geometry_suspect:
+            soft_warn_reasons.append("geometry_suspect=true")
+        if reproj_mean is not None and np.isfinite(float(reproj_mean)):
+            reproj_val = float(reproj_mean)
+            if reproj_val > soft_reproj_limit:
+                soft_warn_reasons.append(f"geometry_reprojection_mean>{soft_reproj_limit:.2f}")
+        if center_offset_max is not None and np.isfinite(float(center_offset_max)):
+            center_offset_val = float(center_offset_max)
+            if center_offset_val > soft_offset_limit:
+                soft_warn_reasons.append(f"slice_center_offset_max>{soft_offset_limit:.1f}")
+    else:
+        if reproj_mean is None or not np.isfinite(float(reproj_mean)):
+            hard_fail_reasons.append("geometry_reprojection_missing")
+        else:
+            reproj_val = float(reproj_mean)
+            if reproj_val > hard_reproj_limit:
+                hard_fail_reasons.append(f"geometry_reprojection_mean>{hard_reproj_limit:.2f}")
+            elif reproj_val > soft_reproj_limit:
+                soft_warn_reasons.append(f"geometry_reprojection_mean>{soft_reproj_limit:.2f}")
+        if center_offset_max is None or not np.isfinite(float(center_offset_max)):
+            hard_fail_reasons.append("slice_center_offset_missing")
+        else:
+            center_offset_val = float(center_offset_max)
+            if center_offset_val > hard_offset_limit:
+                hard_fail_reasons.append(f"slice_center_offset_max>{hard_offset_limit:.1f}")
+            elif center_offset_val > soft_offset_limit:
+                soft_warn_reasons.append(f"slice_center_offset_max>{soft_offset_limit:.1f}")
+    geo_success = len(hard_fail_reasons) == 0
+    geo_quality_level = "bad"
+    if geo_success:
+        geo_quality_level = "good" if (len(soft_warn_reasons) == 0 and not geometry_suspect and slice_mode == "canonical") else "warn"
+    selected_qc["geo_success"] = bool(geo_success)
+    selected_qc["geo_quality_level"] = str(geo_quality_level)
+    selected_qc["geometry_suspect"] = bool(geometry_suspect)
+    selected_qc["slice_mode"] = str(slice_mode)
+    selected_qc["geo_hard_fail_reasons"] = list(hard_fail_reasons)
+    selected_qc["geo_soft_warn_reasons"] = list(soft_warn_reasons)
+    selected_qc["reprojection_error_mean_px"] = (
+        None if reproj_mean is None else float(reproj_mean)
+    )
+    selected_qc["reprojection_error_max_px"] = (
+        None if reproj_max is None else float(reproj_max)
+    )
+    selected_qc["slice_center_offset_max_px"] = (
+        None if center_offset_max is None else float(center_offset_max)
+    )
+    selected_qc["usable_for_stage2"] = bool(geo_success and semantic_ready)
+    selected_qc["semantic_ready"] = bool(semantic_ready)
+    selected_qc["blank_pass"] = bool(semantic_ready)
+    if result.quality_metrics is None:
+        result.quality_metrics = {}
+    result.quality_metrics["geo_success"] = bool(geo_success)
+    result.quality_metrics["semantic_ready"] = bool(semantic_ready)
+    result.quality_metrics["blank_pass"] = bool(semantic_ready)
+    result.quality_metrics["usable_for_stage2"] = bool(geo_success and semantic_ready)
+    result.quality_metrics["geo_quality_level"] = str(geo_quality_level)
+    result.quality_metrics["geometry_suspect"] = bool(geometry_suspect)
+    result.quality_metrics["slice_mode"] = str(slice_mode)
+    result.quality_metrics["reprojection_error_mean_px"] = (
+        None if reproj_mean is None else float(reproj_mean)
+    )
+    result.quality_metrics["reprojection_error_max_px"] = (
+        None if reproj_max is None else float(reproj_max)
+    )
+    result.quality_metrics["slice_center_offset_max_px"] = (
+        None if center_offset_max is None else float(center_offset_max)
+    )
+    result.quality_metrics["geo_hard_fail_reasons"] = list(hard_fail_reasons)
+    result.quality_metrics["geo_soft_warn_reasons"] = list(soft_warn_reasons)
+    result.quality_gate_passed = bool(geo_success)
 
     # 保存 geometry debug 工件
     if geom_debug:
@@ -3709,17 +4721,27 @@ def run_stage1_postprocess_from_json(
             np.savez_compressed(run_dir / "raw_slices.npz", slices=raw_slices)
         geometry_payload = {
             "chip_id": final_chip_id,
-            "status": "failed" if geometry_fail_reasons else "success",
+            "status": "failed" if hard_fail_reasons else ("warn" if soft_warn_reasons else "success"),
             "reprojection_error_mean_px": reproj_mean,
             "reprojection_error_max_px": reproj_max,
-            "reprojection_error_threshold_px": reproj_limit,
+            "reprojection_error_threshold_px": soft_reproj_limit,
+            "reprojection_error_hard_threshold_px": hard_reproj_limit,
             "slice_center_offset_max_px": center_offset_max,
-            "slice_center_offset_threshold_px": POST_QC_MAX_SLICE_CENTER_OFFSET_PX,
+            "slice_center_offset_threshold_px": soft_offset_limit,
+            "slice_center_offset_hard_threshold_px": hard_offset_limit,
             "template_ids": geom_debug.get("template_ids"),
             "semantic_order_clockwise_from_blank": geom_debug.get("semantic_order_clockwise_from_blank"),
             "semantic_roles_by_template": geom_debug.get("semantic_roles_by_template"),
             "semantic_arm_role_by_template": geom_debug.get("semantic_arm_role_by_template"),
             "blank_idx": geom_debug.get("blank_idx"),
+            "blank_status": selected_qc.get("blank_status"),
+            "reference_arm_pred": selected_qc.get("reference_arm_pred"),
+            "blank_id_pred": selected_qc.get("blank_id_pred"),
+            "geo_success": bool(geo_success),
+            "geo_quality_level": str(geo_quality_level),
+            "geometry_suspect": bool(geometry_suspect),
+            "slice_mode": str(slice_mode),
+            "semantic_ready": bool(semantic_ready),
             "transform_type": geom_debug.get("transform_type"),
             "transform_matrix_raw_to_canonical": geom_debug.get("transform_matrix_raw_to_canonical"),
             "inverse_transform_matrix_canonical_to_raw": geom_debug.get("inverse_transform_matrix_canonical_to_raw"),
@@ -3729,20 +4751,29 @@ def run_stage1_postprocess_from_json(
             "det_fit_distance_px": geom_debug.get("det_fit_distance_px"),
             "canonical_points": geom_debug.get("canonical_points"),
             "projected_raw_points": geom_debug.get("projected_raw_points"),
-            "failure_reasons": geometry_fail_reasons,
+            "fill_ratio": selected_qc.get("fill_ratio"),
+            "used_real_points": selected_qc.get("used_real_points"),
+            "model_chosen": selected_qc.get("model_chosen"),
+            "score_sim": selected_qc.get("score_sim"),
+            "score_affine": selected_qc.get("score_affine"),
+            "score_h": selected_qc.get("score_h"),
+            "hard_fail_reasons": hard_fail_reasons,
+            "soft_warn_reasons": soft_warn_reasons,
         }
         with open(run_dir / "debug_geometry_alignment.json", "w", encoding="utf-8") as f:
             json.dump(geometry_payload, f, ensure_ascii=False, indent=2)
 
-    if geometry_fail_reasons:
+    if hard_fail_reasons:
         final_debug_payload["final_status"] = "failed"
         final_debug_payload["final_reason"] = "postprocess_qc_failed: geometry_alignment_failed"
-        final_debug_payload["qc"]["geometry_fail_reasons"] = geometry_fail_reasons
+        final_debug_payload["fail_bucket"] = "fail_geometry_alignment"
+        final_debug_payload["qc"]["geometry_fail_reasons"] = hard_fail_reasons
+        final_debug_payload["qc"]["geo_quality_level"] = "bad"
         final_paths = debug_dump_topology(run_dir, raw_image, final_debug_payload, suffix=None)
         _write_blank_features_debug(run_dir, final_debug_payload)
         _ensure_debug_overlay_from_topology_png(run_dir, final_paths.get("png"))
         raise RuntimeError(
-            f"postprocess_qc_failed: geometry_alignment_failed ({','.join(geometry_fail_reasons)})"
+            f"postprocess_qc_failed: geometry_alignment_failed ({','.join(hard_fail_reasons)})"
         )
 
     output = save_stage1_result(
@@ -3772,7 +4803,8 @@ def run_stage1_postprocess_batch(
     min_topology_detections: Optional[int] = None,
     enable_fallback_detection: bool = True,
     save_individual_slices: bool = False,
-    save_debug: bool = True
+    save_debug: bool = True,
+    export_geo_even_if_blank_unresolved: Optional[bool] = None,
 ) -> List[Stage1Output]:
     """
     批量执行 Stage1 后处理（检测结果来自 JSON）。
@@ -3811,7 +4843,8 @@ def run_stage1_postprocess_batch(
                 enable_fallback_detection=enable_fallback_detection,
                 geometry_engine=geometry_engine,
                 save_individual_slices=save_individual_slices,
-                save_debug=save_debug
+                save_debug=save_debug,
+                export_geo_even_if_blank_unresolved=export_geo_even_if_blank_unresolved,
             )
             outputs.append(output)
         except Exception as e:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
 import shutil
 import sys
@@ -638,6 +639,7 @@ def _evaluate_detection_conf(
     blank_detected_matched = 0
     blank_miss_lit_full_cases: List[str] = []
     over_detection_cases: List[str] = []
+    n_det_lt12_cases: List[str] = []
 
     filtered_preds_map: Dict[str, List[BoxRecord]] = {}
 
@@ -678,6 +680,8 @@ def _evaluate_detection_conf(
             blank_miss_lit_full_cases.append(sample.chip_id)
         if n_total_det >= 14:
             over_detection_cases.append(sample.chip_id)
+        if n_total_det < 12:
+            n_det_lt12_cases.append(sample.chip_id)
 
     cls_name_map: Dict[int, str] = {}
     per_class_payload = val_metrics.get("per_class", {})
@@ -723,6 +727,24 @@ def _evaluate_detection_conf(
             ],
             out_path=out_path,
         )
+    kept_lt12_cases = n_det_lt12_cases[: max(0, key_cases_limit)]
+    for chip_id in kept_lt12_cases:
+        sample = next((s for s in samples if s.chip_id == chip_id), None)
+        if sample is None:
+            continue
+        preds = filtered_preds_map.get(chip_id, [])
+        out_path = key_cases_root / "n_det_lt12" / f"conf_{_conf_tag(conf)}" / f"{chip_id}.png"
+        _draw_detection_overlay(
+            image_path=sample.image_path,
+            gt_boxes=sample.gt_boxes,
+            pred_boxes=preds,
+            title_lines=[
+                f"chip={chip_id} conf={conf:.3f}",
+                "case=n_det_total < 12",
+                f"n_det_total={len(preds)}",
+            ],
+            out_path=out_path,
+        )
 
     recall_blank = _safe_rate(tp_total[0], gt_total[0])
     recall_lit = _safe_rate(tp_total[1], gt_total[1])
@@ -755,6 +777,7 @@ def _evaluate_detection_conf(
         "lit_precision_iou50_at_conf": precision_lit,
         "blank_miss_lit_full_cases": int(len(blank_miss_lit_full_cases)),
         "over_detection_cases": int(len(over_detection_cases)),
+        "n_det_lt12_cases": int(len(n_det_lt12_cases)),
     }
 
     # add per-class AP/Recall from val
@@ -769,6 +792,7 @@ def _evaluate_detection_conf(
     case_lists = {
         "blank_miss_lit_full": blank_miss_lit_full_cases,
         "over_detection": over_detection_cases,
+        "n_det_lt12": n_det_lt12_cases,
     }
     return det_row, case_lists, filtered_preds_map
 
@@ -792,6 +816,19 @@ def _extract_top2_margin(items: Any) -> float:
     return float(s2 - s1)
 
 
+def _classify_fail_bucket(reason: Optional[str]) -> str:
+    text = str(reason or "").lower()
+    if "insufficient_detections_for_topology" in text:
+        return "fail_n_det_lt_min"
+    if "topology_fit_failed" in text:
+        return "fail_topology_fit"
+    if "geometry_alignment_failed" in text:
+        return "fail_geometry_alignment"
+    if "cannot read raw image" in text or "raw image" in text or "file not found" in text:
+        return "fail_io_or_missing_raw"
+    return "fail_io_or_missing_raw"
+
+
 def _evaluate_pipeline_conf(
     *,
     conf: float,
@@ -801,24 +838,42 @@ def _evaluate_pipeline_conf(
     stage1_cfg: Any,
     min_topology_detections: int,
     enable_fallback_detection: bool,
+    export_geo_even_if_blank_unresolved: bool,
     key_cases_root: Path,
     key_cases_limit: int,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     # run postprocess batch
-    run_stage1_postprocess_batch(
-        input_dir=detections_root,
-        output_dir=pipeline_root,
-        config=stage1_cfg,
-        json_name="yolo_raw_detections.json",
-        min_topology_detections=int(min_topology_detections),
-        enable_fallback_detection=bool(enable_fallback_detection),
-        save_individual_slices=False,
-        save_debug=True,
-    )
+    microfluidics_root_logger = logging.getLogger("microfluidics_chip")
+    prev_level = microfluidics_root_logger.level
+    prev_handler_levels = [h.level for h in microfluidics_root_logger.handlers]
+    try:
+        microfluidics_root_logger.setLevel(logging.WARNING)
+        for h in microfluidics_root_logger.handlers:
+            h.setLevel(logging.WARNING)
+        run_stage1_postprocess_batch(
+            input_dir=detections_root,
+            output_dir=pipeline_root,
+            config=stage1_cfg,
+            json_name="yolo_raw_detections.json",
+            min_topology_detections=int(min_topology_detections),
+            enable_fallback_detection=bool(enable_fallback_detection),
+            save_individual_slices=False,
+            save_debug=True,
+            export_geo_even_if_blank_unresolved=bool(export_geo_even_if_blank_unresolved),
+        )
+    finally:
+        microfluidics_root_logger.setLevel(prev_level)
+        for h, lvl in zip(microfluidics_root_logger.handlers, prev_handler_levels):
+            h.setLevel(lvl)
 
     n_total = len(samples)
     geo_pass_cnt = 0
     blank_pass_cnt = 0
+    usable_for_stage2_cnt = 0
+    geo_output_cnt = 0
+    geo_good_cnt = 0
+    semantic_ready_cnt = 0
+    used_fallback_cnt = 0
     stage_success_cnt = 0
     reproj_mean_vals: List[float] = []
     reproj_max_vals: List[float] = []
@@ -837,90 +892,150 @@ def _evaluate_pipeline_conf(
     blank_unresolved_cases: List[str] = []
     pose_ambiguous_cases: List[str] = []
 
+    bucket_names = [
+        "fail_n_det_lt_min",
+        "fail_topology_fit",
+        "fail_geometry_alignment",
+        "fail_io_or_missing_raw",
+    ]
+    fail_counts: Dict[str, int] = {k: 0 for k in bucket_names}
+    fail_cases_by_bucket: Dict[str, List[str]] = {k: [] for k in bucket_names}
+
     for sample in samples:
         run_dir = pipeline_root / sample.chip_id
         topo = _read_json(run_dir / "debug_stage1_topology.json")
         geom = _read_json(run_dir / "debug_geometry_alignment.json")
         stage_meta = _read_json(run_dir / "stage1_metadata.json")
+        quality_metrics = (
+            stage_meta.get("quality_metrics", {})
+            if isinstance(stage_meta.get("quality_metrics"), dict)
+            else {}
+        )
+        qc = topo.get("qc", {}) if isinstance(topo.get("qc"), dict) else {}
+        blank = topo.get("blank", {}) if isinstance(topo.get("blank"), dict) else {}
 
         final_status = str(topo.get("final_status", topo.get("status", "failed"))).lower()
         if final_status == "success":
             stage_success_cnt += 1
 
-        qc = topo.get("qc", {}) if isinstance(topo.get("qc"), dict) else {}
-        blank = topo.get("blank", {}) if isinstance(topo.get("blank"), dict) else {}
-
-        # geo pass
-        topo_fit_pass = bool(qc.get("fit_success", False))
         reproj_mean = _safe_float(
-            geom.get("reprojection_error_mean_px", qc.get("reprojection_error_mean_px"))
+            geom.get(
+                "reprojection_error_mean_px",
+                quality_metrics.get("reprojection_error_mean_px", qc.get("reprojection_error_mean_px")),
+            )
         )
         reproj_max = _safe_float(
-            geom.get("reprojection_error_max_px", qc.get("reprojection_error_max_px"))
+            geom.get(
+                "reprojection_error_max_px",
+                quality_metrics.get("reprojection_error_max_px", qc.get("reprojection_error_max_px")),
+            )
         )
-        reproj_thr = _safe_float(
-            geom.get("reprojection_error_threshold_px", qc.get("reprojection_error_threshold_px"))
+        center_offset_max = _safe_float(
+            geom.get(
+                "slice_center_offset_max_px",
+                quality_metrics.get("slice_center_offset_max_px"),
+            )
         )
-        center_offset_max = _safe_float(geom.get("slice_center_offset_max_px"))
-        center_offset_thr = _safe_float(geom.get("slice_center_offset_threshold_px"), default=8.0)
-
         reproj_mean_vals.append(reproj_mean)
         reproj_max_vals.append(reproj_max)
         offset_max_vals.append(center_offset_max)
 
-        geo_pass = bool(
-            topo_fit_pass
-            and np.isfinite(reproj_mean)
-            and np.isfinite(center_offset_max)
-            and (not np.isfinite(reproj_thr) or reproj_mean <= reproj_thr)
-            and (not np.isfinite(center_offset_thr) or center_offset_max <= center_offset_thr)
+        blank_status = str(
+            quality_metrics.get(
+                "blank_status",
+                blank.get("blank_status_pred", blank.get("blank_status", qc.get("blank_status_pred", qc.get("blank_status", "unknown")))),
+            )
         )
-        if geo_pass:
-            geo_pass_cnt += 1
-        else:
-            geometry_fail_cases.append(sample.chip_id)
-
-        # blank pass
-        blank_status = str(blank.get("blank_status_pred", blank.get("blank_status", qc.get("blank_status_pred", qc.get("blank_status", "unknown")))))
-        blank_conf = _safe_float(blank.get("blank_confidence", qc.get("blank_confidence")))
-        blank_spread = _safe_float(blank.get("blank_score_spread", qc.get("blank_score_spread")))
+        blank_conf = _safe_float(quality_metrics.get("blank_confidence", blank.get("blank_confidence", qc.get("blank_confidence"))))
+        blank_spread = _safe_float(quality_metrics.get("blank_score_spread", blank.get("blank_score_spread", qc.get("blank_score_spread"))))
         blank_spread_gate = _safe_float(qc.get("blank_spread_gate"), default=float("nan"))
-        ref_arm_pred = blank.get("reference_arm_pred", blank.get("reference_arm", qc.get("reference_arm_pred", qc.get("reference_arm"))))
-        arm_margin = _safe_float(blank.get("arm_margin", qc.get("arm_margin_pred")))
-        blank_margin = _safe_float(blank.get("blank_margin", qc.get("blank_margin_pred")))
+        ref_arm_pred = quality_metrics.get(
+            "reference_arm_pred",
+            blank.get("reference_arm_pred", blank.get("reference_arm", qc.get("reference_arm_pred", qc.get("reference_arm")))),
+        )
+        arm_margin = _safe_float(quality_metrics.get("arm_margin_pred", blank.get("arm_margin", qc.get("arm_margin_pred"))))
+        blank_margin = _safe_float(quality_metrics.get("blank_margin_pred", blank.get("blank_margin", qc.get("blank_margin_pred"))))
         arm_margin_thr = _safe_float(qc.get("blank_arm_margin_thr"))
         blank_margin_thr = _safe_float(qc.get("blank_margin_thr"))
         arm_top2_margin = _extract_top2_margin(blank.get("arm_top2", []))
         blank_top2_margin = _extract_top2_margin(blank.get("blank_top2", []))
-
         arm_margin_vals.append(arm_margin)
         blank_margin_vals.append(blank_margin)
         arm_top2_margin_vals.append(arm_top2_margin)
         blank_top2_margin_vals.append(blank_top2_margin)
 
-        arm_margin_ok = True
-        if np.isfinite(arm_margin) and np.isfinite(arm_margin_thr):
-            arm_margin_ok = bool(arm_margin >= arm_margin_thr)
-        blank_margin_ok = True
-        if np.isfinite(blank_margin) and np.isfinite(blank_margin_thr):
-            blank_margin_ok = bool(blank_margin >= blank_margin_thr)
-        blank_spread_ok = True
-        if np.isfinite(blank_spread_gate) and np.isfinite(blank_spread):
-            blank_spread_ok = bool(blank_spread >= blank_spread_gate)
+        # read meta-ready fields first (new pipeline)
+        geo_success_meta = stage_meta.get("geo_success")
+        if geo_success_meta is None:
+            geo_success_meta = quality_metrics.get("geo_success")
+        semantic_ready_meta = stage_meta.get("semantic_ready")
+        if semantic_ready_meta is None:
+            semantic_ready_meta = quality_metrics.get("semantic_ready", quality_metrics.get("blank_pass"))
+        geo_quality_level = str(
+            stage_meta.get(
+                "geo_quality_level",
+                quality_metrics.get("geo_quality_level", ""),
+            )
+        ).strip().lower()
 
-        blank_pass = bool(
-            ref_arm_pred is not None
-            and blank_status != "unresolved"
-            and np.isfinite(blank_conf)
-            and blank_conf >= 0.01
-            and blank_spread_ok
-            and arm_margin_ok
-            and blank_margin_ok
-        )
+        # backward-compatible fallback for old outputs
+        if geo_success_meta is None:
+            topo_fit_pass = bool(qc.get("fit_success", False))
+            reproj_thr = _safe_float(
+                geom.get("reprojection_error_threshold_px", qc.get("reprojection_error_threshold_px"))
+            )
+            center_offset_thr = _safe_float(geom.get("slice_center_offset_threshold_px"), default=8.0)
+            geo_success_meta = bool(
+                topo_fit_pass
+                and np.isfinite(reproj_mean)
+                and np.isfinite(center_offset_max)
+                and (not np.isfinite(reproj_thr) or reproj_mean <= reproj_thr)
+                and (not np.isfinite(center_offset_thr) or center_offset_max <= center_offset_thr)
+            )
+        if semantic_ready_meta is None:
+            arm_margin_ok = True
+            if np.isfinite(arm_margin) and np.isfinite(arm_margin_thr):
+                arm_margin_ok = bool(arm_margin >= arm_margin_thr)
+            blank_margin_ok = True
+            if np.isfinite(blank_margin) and np.isfinite(blank_margin_thr):
+                blank_margin_ok = bool(blank_margin >= blank_margin_thr)
+            blank_spread_ok = True
+            if np.isfinite(blank_spread_gate) and np.isfinite(blank_spread):
+                blank_spread_ok = bool(blank_spread >= blank_spread_gate)
+            semantic_ready_meta = bool(
+                ref_arm_pred is not None
+                and blank_status != "unresolved"
+                and np.isfinite(blank_conf)
+                and blank_conf >= 0.01
+                and blank_spread_ok
+                and arm_margin_ok
+                and blank_margin_ok
+            )
+
+        geo_pass = bool(geo_success_meta)
+        blank_pass = bool(semantic_ready_meta)
+        if geo_pass:
+            geo_pass_cnt += 1
+            geo_output_cnt += 1
+            if geo_quality_level == "good" or geo_quality_level == "":
+                geo_good_cnt += 1
+        else:
+            fail_reason = str(topo.get("final_reason", topo.get("failure_reason", "")))
+            bucket = _classify_fail_bucket(fail_reason)
+            fail_counts[bucket] += 1
+            fail_cases_by_bucket[bucket].append(sample.chip_id)
+            if bucket == "fail_geometry_alignment":
+                geometry_fail_cases.append(sample.chip_id)
         if blank_pass:
             blank_pass_cnt += 1
+            semantic_ready_cnt += 1
         else:
             blank_unresolved_cases.append(sample.chip_id)
+        if geo_pass and blank_pass:
+            usable_for_stage2_cnt += 1
+
+        if bool(quality_metrics.get("used_fallback", False)):
+            used_fallback_cnt += 1
 
         if (
             np.isfinite(arm_top2_margin)
@@ -931,38 +1046,75 @@ def _evaluate_pipeline_conf(
         ):
             pose_ambiguous_cases.append(sample.chip_id)
 
-        # optional gt-based accuracy
-        blank_id_pred = _safe_int(blank.get("blank_id_pred", blank.get("blank_id")), default=-1)
+        blank_id_pred = _safe_int(
+            stage_meta.get("blank_id_pred", quality_metrics.get("blank_id_pred", blank.get("blank_id_pred", blank.get("blank_id")))),
+            default=-1,
+        )
         if sample.gt_blank_template_idx is not None and blank_id_pred >= 0:
             blank_gt_available += 1
             blank_acc_values.append(int(blank_id_pred == int(sample.gt_blank_template_idx)))
-
         if sample.gt_reference_arm is not None and ref_arm_pred is not None:
             ref_gt_available += 1
             ref_acc_values.append(int(str(ref_arm_pred) == str(sample.gt_reference_arm)))
 
-        # copy key artifacts
         if sample.chip_id in geometry_fail_cases[: max(0, key_cases_limit)]:
             dst_dir = key_cases_root / "pipeline_geometry_fail" / f"conf_{_conf_tag(conf)}" / sample.chip_id
             _copy_if_exists(run_dir / "debug_stage1_topology.png", dst_dir / "debug_stage1_topology.png")
             _copy_if_exists(run_dir / "debug_overlay.png", dst_dir / "debug_overlay.png")
             _copy_if_exists(sample.image_path, dst_dir / sample.image_path.name)
+            dst_dir_short = key_cases_root / "geo_fail" / f"conf_{_conf_tag(conf)}" / sample.chip_id
+            _copy_if_exists(run_dir / "debug_stage1_topology.png", dst_dir_short / "debug_stage1_topology.png")
+            _copy_if_exists(run_dir / "debug_overlay.png", dst_dir_short / "debug_overlay.png")
+            _copy_if_exists(sample.image_path, dst_dir_short / sample.image_path.name)
         if sample.chip_id in blank_unresolved_cases[: max(0, key_cases_limit)]:
             dst_dir = key_cases_root / "pipeline_blank_unresolved" / f"conf_{_conf_tag(conf)}" / sample.chip_id
             _copy_if_exists(run_dir / "debug_stage1_topology.png", dst_dir / "debug_stage1_topology.png")
             _copy_if_exists(run_dir / "debug_blank_features.json", dst_dir / "debug_blank_features.json")
             _copy_if_exists(sample.image_path, dst_dir / sample.image_path.name)
+            dst_dir_short = key_cases_root / "blank_unresolved" / f"conf_{_conf_tag(conf)}" / sample.chip_id
+            _copy_if_exists(run_dir / "debug_stage1_topology.png", dst_dir_short / "debug_stage1_topology.png")
+            _copy_if_exists(run_dir / "debug_blank_features.json", dst_dir_short / "debug_blank_features.json")
+            _copy_if_exists(sample.image_path, dst_dir_short / sample.image_path.name)
         if sample.chip_id in pose_ambiguous_cases[: max(0, key_cases_limit)]:
             dst_dir = key_cases_root / "pipeline_pose_ambiguity" / f"conf_{_conf_tag(conf)}" / sample.chip_id
             _copy_if_exists(run_dir / "debug_stage1_topology.png", dst_dir / "debug_stage1_topology.png")
             _copy_if_exists(sample.image_path, dst_dir / sample.image_path.name)
 
+    fail_breakdown_rows: List[Dict[str, Any]] = []
+    for bucket in bucket_names:
+        case_ids = fail_cases_by_bucket[bucket]
+        kept = case_ids[: max(0, min(5, key_cases_limit))]
+        for chip_id in kept:
+            run_dir = pipeline_root / chip_id
+            dst_dir = key_cases_root / "fail_buckets" / bucket / f"conf_{_conf_tag(conf)}" / chip_id
+            _copy_if_exists(run_dir / "debug_stage1_topology.png", dst_dir / "debug_stage1_topology.png")
+            _copy_if_exists(run_dir / "debug_overlay.png", dst_dir / "debug_overlay.png")
+            _copy_if_exists(run_dir / "debug_geometry_alignment.json", dst_dir / "debug_geometry_alignment.json")
+            sample = next((s for s in samples if s.chip_id == chip_id), None)
+            if sample is not None:
+                _copy_if_exists(sample.image_path, dst_dir / sample.image_path.name)
+        fail_breakdown_rows.append(
+            {
+                "conf": float(conf),
+                "bucket": str(bucket),
+                "count": int(fail_counts[bucket]),
+                "rate": _safe_rate(fail_counts[bucket], n_total),
+                "example_cases": ";".join(kept),
+            }
+        )
+
+    fail_bucket_json = json.dumps({k: int(v) for k, v in fail_counts.items()}, ensure_ascii=False)
     row = {
         "conf": float(conf),
         "n_images": int(n_total),
         "stage1_success_rate": _safe_rate(stage_success_cnt, n_total),
         "geo_pass_rate": _safe_rate(geo_pass_cnt, n_total),
         "blank_pass_rate": _safe_rate(blank_pass_cnt, n_total),
+        "usable_for_stage2_rate": _safe_rate(usable_for_stage2_cnt, n_total),
+        "geo_output_rate": _safe_rate(geo_output_cnt, n_total),
+        "geo_good_rate": _safe_rate(geo_good_cnt, n_total),
+        "semantic_ready_rate": _safe_rate(semantic_ready_cnt, n_total),
+        "used_fallback_rate": _safe_rate(used_fallback_cnt, n_total),
         "reprojection_error_mean_px_mean": _mean(reproj_mean_vals),
         "reprojection_error_mean_px_median": _median(reproj_mean_vals),
         "reprojection_error_mean_px_p95": _quantile(reproj_mean_vals, 95),
@@ -987,8 +1139,18 @@ def _evaluate_pipeline_conf(
         "reference_arm_gt_coverage": _safe_rate(ref_gt_available, n_total),
         "blank_accuracy": _mean(blank_acc_values),
         "reference_arm_accuracy": _mean(ref_acc_values),
+        "geo_output_count": int(geo_output_cnt),
+        "geo_good_count": int(geo_good_cnt),
+        "semantic_ready_count": int(semantic_ready_cnt),
+        "usable_for_stage2_count": int(usable_for_stage2_cnt),
+        "used_fallback_count": int(used_fallback_cnt),
+        "fail_n_det_lt_min": int(fail_counts["fail_n_det_lt_min"]),
+        "fail_topology_fit": int(fail_counts["fail_topology_fit"]),
+        "fail_geometry_alignment": int(fail_counts["fail_geometry_alignment"]),
+        "fail_io_or_missing_raw": int(fail_counts["fail_io_or_missing_raw"]),
+        "fail_bucket": fail_bucket_json,
     }
-    return row
+    return row, fail_breakdown_rows
 
 
 def _write_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
@@ -1077,6 +1239,8 @@ def _make_report(
     blank_miss_lit_full = _safe_float(rec_det.get("blank_miss_lit_full_cases"), default=0.0)
     geo_pass = _safe_float(rec_pipe.get("geo_pass_rate"))
     blank_pass = _safe_float(rec_pipe.get("blank_pass_rate"))
+    geo_output = _safe_float(rec_pipe.get("geo_output_rate"))
+    semantic_ready = _safe_float(rec_pipe.get("semantic_ready_rate"))
     ref_acc = _safe_float(rec_pipe.get("reference_arm_accuracy"))
     blank_acc = _safe_float(rec_pipe.get("blank_accuracy"))
 
@@ -1116,6 +1280,8 @@ def _make_report(
         *cls_lines,
         "",
         "## Task B: Pipeline (topology + canonical slicing)",
+        f"- recommended conf row geo_output_rate: `{geo_output:.4f}`",
+        f"- recommended conf row semantic_ready_rate: `{semantic_ready:.4f}`",
         f"- recommended conf row geo_pass: `{geo_pass:.4f}`",
         f"- recommended conf row blank_pass: `{blank_pass:.4f}`",
         f"- reference_arm accuracy (if inferable from GT geometry): `{ref_acc:.4f}`",
@@ -1153,7 +1319,20 @@ def main() -> None:
     parser.add_argument("--min-topology-detections", type=int, default=8)
     parser.add_argument("--max-samples", type=int, default=0, help="0 means all")
     parser.add_argument("--enable-fallback-detection", action="store_true")
+    parser.add_argument(
+        "--export-geo-even-if-blank-unresolved",
+        dest="export_geo_even_if_blank_unresolved",
+        action="store_true",
+        help="geometry pass 时即导出切片（不因 blank unresolved 失败）",
+    )
+    parser.add_argument(
+        "--strict-semantic-success",
+        dest="export_geo_even_if_blank_unresolved",
+        action="store_false",
+        help="要求 blank/reference_arm 语义通过才导出切片",
+    )
     parser.add_argument("--key-cases-limit", type=int, default=30)
+    parser.set_defaults(export_geo_even_if_blank_unresolved=True)
     args = parser.parse_args()
 
     output_dir = args.output_dir.resolve()
@@ -1215,6 +1394,7 @@ def main() -> None:
 
     detection_rows: List[Dict[str, Any]] = []
     pipeline_rows: List[Dict[str, Any]] = []
+    fail_breakdown_rows_all: List[Dict[str, Any]] = []
     key_cases_root = output_dir / "key_cases"
 
     for conf in conf_list:
@@ -1235,7 +1415,7 @@ def main() -> None:
         )
         detection_rows.append(det_row)
 
-        pipe_row = _evaluate_pipeline_conf(
+        pipe_row, pipe_fail_rows = _evaluate_pipeline_conf(
             conf=conf,
             samples=samples,
             detections_root=det_json_root,
@@ -1243,16 +1423,35 @@ def main() -> None:
             stage1_cfg=stage1_cfg,
             min_topology_detections=int(args.min_topology_detections),
             enable_fallback_detection=bool(args.enable_fallback_detection),
+            export_geo_even_if_blank_unresolved=bool(args.export_geo_even_if_blank_unresolved),
             key_cases_root=key_cases_root,
             key_cases_limit=args.key_cases_limit,
         )
         pipeline_rows.append(pipe_row)
+        fail_breakdown_rows_all.extend(pipe_fail_rows)
         print(f"[INFO] conf={conf:.3f} done")
 
     detection_csv = output_dir / "detection_ablation_table.csv"
     pipeline_csv = output_dir / "pipeline_ablation_table.csv"
+    fail_breakdown_csv = output_dir / "fail_breakdown.csv"
+    summary_csv = output_dir / "summary.csv"
     _write_csv(detection_csv, detection_rows)
     _write_csv(pipeline_csv, pipeline_rows)
+    _write_csv(fail_breakdown_csv, fail_breakdown_rows_all)
+    summary_rows: List[Dict[str, Any]] = []
+    for row in pipeline_rows:
+        summary_rows.append(
+            {
+                "conf": float(row.get("conf", float("nan"))),
+                "geo_output_rate": _safe_float(row.get("geo_output_rate")),
+                "geo_good_rate": _safe_float(row.get("geo_good_rate")),
+                "semantic_ready_rate": _safe_float(row.get("semantic_ready_rate")),
+                "usable_for_stage2_rate": _safe_float(row.get("usable_for_stage2_rate")),
+                "used_fallback_rate": _safe_float(row.get("used_fallback_rate")),
+                "fail_bucket": row.get("fail_bucket", "{}"),
+            }
+        )
+    _write_csv(summary_csv, summary_rows)
 
     recommended_conf = _choose_recommended_conf(detection_rows, pipeline_rows)
     recommended_min_det = _recommend_min_detections(detection_rows, conf=recommended_conf)
@@ -1274,6 +1473,8 @@ def main() -> None:
     print("[INFO] outputs:")
     print(f"  - {detection_csv}")
     print(f"  - {pipeline_csv}")
+    print(f"  - {summary_csv}")
+    print(f"  - {fail_breakdown_csv}")
     print(f"  - {report_md}")
     print(f"  - {key_cases_root}")
     print(f"[INFO] recommended conf={recommended_conf:.3f}, min_topology_detections={recommended_min_det}")

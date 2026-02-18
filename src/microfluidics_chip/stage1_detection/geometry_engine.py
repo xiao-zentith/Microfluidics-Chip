@@ -53,6 +53,53 @@ class CrossGeometryEngine:
         homo = CrossGeometryEngine._as_homo(points)
         return (M.astype(np.float32) @ homo.T).T
 
+    @staticmethod
+    def _transform_apply(matrix: np.ndarray, points: np.ndarray, model: str) -> np.ndarray:
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[1] != 2 or pts.size == 0:
+            return np.empty((0, 2), dtype=np.float32)
+        m = np.asarray(matrix, dtype=np.float32)
+        model_norm = str(model).strip().lower()
+        if model_norm == "homography":
+            if m.shape != (3, 3):
+                return np.empty((0, 2), dtype=np.float32)
+            return cv2.perspectiveTransform(pts.reshape(-1, 1, 2), m).reshape(-1, 2).astype(np.float32)
+        if m.shape != (2, 3):
+            return np.empty((0, 2), dtype=np.float32)
+        return cv2.transform(pts.reshape(-1, 1, 2), m).reshape(-1, 2).astype(np.float32)
+
+    @staticmethod
+    def _transform_inverse(matrix: np.ndarray, model: str) -> Optional[np.ndarray]:
+        m = np.asarray(matrix, dtype=np.float32)
+        model_norm = str(model).strip().lower()
+        if model_norm == "homography":
+            if m.shape != (3, 3):
+                return None
+            try:
+                inv = np.linalg.inv(m)
+            except Exception:
+                return None
+            return inv.astype(np.float32)
+        if m.shape != (2, 3):
+            return None
+        return cv2.invertAffineTransform(m).astype(np.float32)
+
+    def _crop_patch_with_radius(self, image: np.ndarray, cx: float, cy: float, radius: float) -> np.ndarray:
+        r = int(max(2, round(float(radius))))
+        x1 = int(round(cx - r))
+        y1 = int(round(cy - r))
+        x2 = int(round(cx + r))
+        y2 = int(round(cy + r))
+        patch = image[
+            max(0, y1):min(image.shape[0], y2),
+            max(0, x1):min(image.shape[1], x2)
+        ]
+        if patch.size == 0:
+            return np.zeros((self.config.slice_size[1], self.config.slice_size[0], 3), dtype=np.uint8)
+        if patch.shape[0] != self.config.slice_size[0] or patch.shape[1] != self.config.slice_size[1]:
+            patch = cv2.resize(patch, self.config.slice_size)
+        return patch
+
     def _crop_patch(self, image: np.ndarray, cx: float, cy: float) -> np.ndarray:
         x1 = int(round(cx - self.config.crop_radius))
         y1 = int(round(cy - self.config.crop_radius))
@@ -360,19 +407,35 @@ class CrossGeometryEngine:
         else:
             topology_fitted_raw = final_raw.copy()
         canonical_pts = self._compute_canonical_points(template_points)
+        slice_mode = str(canonical_context.get("slice_mode", "canonical")).strip().lower()
+        if slice_mode == "det_fallback":
+            return self._process_det_fallback(
+                img=img,
+                canonical_context=canonical_context,
+                final_raw=final_raw,
+                canonical_pts=canonical_pts,
+                topology_fitted_raw=topology_fitted_raw,
+            )
 
-        # 优先 similarity，必要时 affine
-        M, inlier_mask = cv2.estimateAffinePartial2D(
-            final_raw.reshape(-1, 1, 2),
-            canonical_pts.reshape(-1, 1, 2),
-            method=cv2.RANSAC,
-            ransacReprojThreshold=3.0,
-            maxIters=2000,
-            confidence=0.99,
-        )
-        transform_type = "similarity"
+        transform_type = str(canonical_context.get("transform_model_chosen", "similarity")).strip().lower()
+        M_payload = canonical_context.get("transform_raw_to_canonical")
+        inlier_mask = None
+        M: Optional[np.ndarray] = None
+        if isinstance(M_payload, list):
+            M_arr = np.asarray(M_payload, dtype=np.float32)
+            if transform_type == "homography" and M_arr.shape == (3, 3):
+                M = M_arr
+            elif transform_type in {"similarity", "affine"} and M_arr.shape == (2, 3):
+                M = M_arr
+            elif M_arr.shape == (2, 3):
+                M = M_arr
+                transform_type = "affine"
+            elif M_arr.shape == (3, 3):
+                M = M_arr
+                transform_type = "homography"
         if M is None:
-            M, inlier_mask = cv2.estimateAffine2D(
+            # 兼容旧逻辑：无预计算矩阵时内部拟合
+            M_try, inlier_mask = cv2.estimateAffinePartial2D(
                 final_raw.reshape(-1, 1, 2),
                 canonical_pts.reshape(-1, 1, 2),
                 method=cv2.RANSAC,
@@ -380,18 +443,38 @@ class CrossGeometryEngine:
                 maxIters=2000,
                 confidence=0.99,
             )
-            transform_type = "affine"
-        if M is None:
-            logger.warning("Template-driven affine solve failed")
-            return None, None, None, None
+            transform_type = "similarity"
+            if M_try is None:
+                M_try, inlier_mask = cv2.estimateAffine2D(
+                    final_raw.reshape(-1, 1, 2),
+                    canonical_pts.reshape(-1, 1, 2),
+                    method=cv2.RANSAC,
+                    ransacReprojThreshold=3.0,
+                    maxIters=2000,
+                    confidence=0.99,
+                )
+                transform_type = "affine"
+            if M_try is None:
+                logger.warning("Template-driven affine solve failed")
+                return None, None, None, None
+            M = np.asarray(M_try, dtype=np.float32)
 
-        aligned = cv2.warpAffine(
-            img,
-            M,
-            (self.config.canvas_size, self.config.canvas_size),
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
-        )
+        if transform_type == "homography":
+            aligned = cv2.warpPerspective(
+                img,
+                M.astype(np.float32),
+                (self.config.canvas_size, self.config.canvas_size),
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+        else:
+            aligned = cv2.warpAffine(
+                img,
+                M.astype(np.float32),
+                (self.config.canvas_size, self.config.canvas_size),
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
 
         # canonical slices (主输出)
         canonical_slices: List[np.ndarray] = []
@@ -406,13 +489,16 @@ class CrossGeometryEngine:
         raw_slices_np = np.asarray(raw_slices)
 
         # 变换一致性与投影误差
-        invM = cv2.invertAffineTransform(M.astype(np.float32))
-        projected_raw = self._affine_apply(invM, canonical_pts)
+        invM = self._transform_inverse(M.astype(np.float32), transform_type)
+        if invM is None:
+            projected_raw = final_raw.copy()
+        else:
+            projected_raw = self._transform_apply(invM, canonical_pts, "homography" if invM.shape == (3, 3) else "affine")
         reproj_vec = np.linalg.norm(projected_raw - final_raw, axis=1)
         reproj_mean = float(np.mean(reproj_vec))
         reproj_max = float(np.max(reproj_vec))
 
-        projected_canonical = self._affine_apply(M.astype(np.float32), final_raw)
+        projected_canonical = self._transform_apply(M.astype(np.float32), final_raw, transform_type)
         center_offset_vec = np.linalg.norm(projected_canonical - canonical_pts, axis=1)
         center_offset_mean = float(np.mean(center_offset_vec))
         center_offset_max = float(np.max(center_offset_vec))
@@ -476,8 +562,13 @@ class CrossGeometryEngine:
                 cv2.LINE_AA,
             )
 
-        rotation_angle = math.degrees(math.atan2(M[1, 0], M[0, 0]))
-        scale_factor = math.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
+        if transform_type == "homography":
+            A = np.asarray(M, dtype=np.float32)[:2, :2]
+            rotation_angle = math.degrees(math.atan2(A[1, 0], A[0, 0]))
+            scale_factor = math.sqrt(A[0, 0] ** 2 + A[1, 0] ** 2)
+        else:
+            rotation_angle = math.degrees(math.atan2(M[1, 0], M[0, 0]))
+            scale_factor = math.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
         blank_arm = int(blank_idx) // 3 if blank_idx is not None else 0
         chip_centroid = tuple(np.mean(final_raw, axis=0).tolist())
 
@@ -489,15 +580,22 @@ class CrossGeometryEngine:
             matrix=M.tolist(),
         )
 
-        inliers = int(np.sum(inlier_mask)) if inlier_mask is not None else 0
+        inliers = int(canonical_context.get("inliers_count_sim", 0))
+        if transform_type == "affine":
+            inliers = int(canonical_context.get("inliers_count_affine", inliers))
+        elif transform_type == "homography":
+            inliers = int(canonical_context.get("inliers_count_h", inliers))
+        if inliers <= 0 and inlier_mask is not None:
+            inliers = int(np.sum(inlier_mask))
         template_ids = canonical_context.get("template_ids") or [str(i) for i in range(12)]
         semantic_order = canonical_context.get("semantic_order_clockwise_from_blank") or []
 
         self.last_process_debug = {
             "mode": "template_canonical",
+            "slice_mode": "canonical",
             "transform_type": transform_type,
             "transform_matrix_raw_to_canonical": M.tolist(),
-            "inverse_transform_matrix_canonical_to_raw": invM.tolist(),
+            "inverse_transform_matrix_canonical_to_raw": invM.tolist() if invM is not None else None,
             "n_inliers_transform": inliers,
             "fitted_points_raw": final_raw.tolist(),
             "topology_fitted_points_raw": topology_fitted_raw.tolist(),
@@ -522,6 +620,118 @@ class CrossGeometryEngine:
             "Template-driven geometry: inliers=%d reproj_mean=%.3f reproj_max=%.3f center_off_max=%.3f",
             inliers, reproj_mean, reproj_max, center_offset_max
         )
+        return aligned, chamber_slices, transform_params, debug_vis
+
+    def _process_det_fallback(
+        self,
+        img: np.ndarray,
+        canonical_context: Dict[str, Any],
+        final_raw: np.ndarray,
+        canonical_pts: np.ndarray,
+        topology_fitted_raw: np.ndarray,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[TransformParams], Optional[np.ndarray]]:
+        point_source = list(canonical_context.get("point_source") or [])
+        pitch_final = float(canonical_context.get("pitch_final", float(self.config.ideal_chamber_step)))
+        if not np.isfinite(pitch_final):
+            pitch_final = float(self.config.ideal_chamber_step)
+        radius = float(canonical_context.get("det_fallback_crop_radius_px", float("nan")))
+        if not np.isfinite(radius):
+            radius = float(np.clip(0.55 * pitch_final, 12.0, 96.0))
+
+        slices: List[np.ndarray] = []
+        for i in range(12):
+            cx, cy = final_raw[i]
+            slices.append(self._crop_patch_with_radius(img, float(cx), float(cy), radius=radius))
+        chamber_slices = np.asarray(slices)
+        aligned = img.copy()
+
+        debug_overlay = img.copy()
+        for i in range(12):
+            cx, cy = final_raw[i]
+            p = (int(round(float(cx))), int(round(float(cy))))
+            source = str(point_source[i]) if i < len(point_source) else "filled"
+            color = (0, 255, 0) if source in {"det", "det_mid"} else (255, 0, 255)
+            cv2.circle(debug_overlay, p, 5, color, -1, cv2.LINE_AA)
+            cv2.rectangle(
+                debug_overlay,
+                (p[0] - int(round(radius)), p[1] - int(round(radius))),
+                (p[0] + int(round(radius)), p[1] + int(round(radius))),
+                color,
+                1,
+            )
+            cv2.putText(
+                debug_overlay,
+                f"{i}:{source}",
+                (p[0] + 6, p[1] - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        debug_vis = debug_overlay.copy()
+
+        blank_idx = canonical_context.get("blank_idx")
+        if blank_idx is not None and 0 <= int(blank_idx) < 12:
+            bx, by = final_raw[int(blank_idx)]
+            cv2.circle(debug_overlay, (int(round(bx)), int(round(by))), 18, (0, 0, 255), 2, cv2.LINE_AA)
+
+        matrix_payload = canonical_context.get("transform_raw_to_canonical")
+        transform_type = str(canonical_context.get("transform_model_chosen", "det_fallback")).strip().lower()
+        matrix = None
+        if isinstance(matrix_payload, list):
+            m = np.asarray(matrix_payload, dtype=np.float32)
+            if m.shape in {(2, 3), (3, 3)}:
+                matrix = m
+
+        reproj_mean = canonical_context.get("reproj_mean")
+        reproj_max = canonical_context.get("reproj_max")
+        reproj_mean_val = float(reproj_mean) if reproj_mean is not None and np.isfinite(float(reproj_mean)) else float("nan")
+        reproj_max_val = float(reproj_max) if reproj_max is not None and np.isfinite(float(reproj_max)) else float("nan")
+        if not np.isfinite(reproj_mean_val):
+            reproj_mean_val = 0.0
+        if not np.isfinite(reproj_max_val):
+            reproj_max_val = reproj_mean_val
+
+        chip_centroid = tuple(np.mean(final_raw, axis=0).tolist())
+        transform_params = TransformParams(
+            rotation_angle=0.0,
+            scale_factor=1.0,
+            chip_centroid=(float(chip_centroid[0]), float(chip_centroid[1])),
+            blank_arm_index=int(blank_idx) // 3 if blank_idx is not None else 0,
+            matrix=(matrix.tolist() if matrix is not None else None),
+        )
+
+        inv_matrix = None
+        if matrix is not None:
+            inv_matrix = self._transform_inverse(matrix, transform_type)
+
+        self.last_process_debug = {
+            "mode": "det_fallback",
+            "slice_mode": "det_fallback",
+            "transform_type": transform_type,
+            "transform_matrix_raw_to_canonical": matrix.tolist() if matrix is not None else None,
+            "inverse_transform_matrix_canonical_to_raw": inv_matrix.tolist() if inv_matrix is not None else None,
+            "n_inliers_transform": int(canonical_context.get("used_real_points", 0)),
+            "fitted_points_raw": final_raw.tolist(),
+            "topology_fitted_points_raw": topology_fitted_raw.tolist(),
+            "canonical_points": canonical_pts.tolist(),
+            "projected_raw_points": final_raw.tolist(),
+            "template_ids": canonical_context.get("template_ids") or [str(i) for i in range(12)],
+            "semantic_order_clockwise_from_blank": canonical_context.get("semantic_order_clockwise_from_blank") or [],
+            "point_source": canonical_context.get("point_source"),
+            "det_fit_distance_px": canonical_context.get("det_fit_distance_px"),
+            "semantic_roles_by_template": canonical_context.get("semantic_roles_by_template"),
+            "semantic_arm_role_by_template": canonical_context.get("semantic_arm_role_by_template"),
+            "blank_idx": int(blank_idx) if blank_idx is not None else None,
+            "reprojection_error_mean_px": float(reproj_mean_val),
+            "reprojection_error_max_px": float(reproj_max_val),
+            "slice_center_offset_mean_px": 0.0,
+            "slice_center_offset_max_px": 0.0,
+            "raw_slices": chamber_slices,
+            "debug_overlay_raw": debug_overlay,
+            "crop_radius_px": float(radius),
+        }
         return aligned, chamber_slices, transform_params, debug_vis
     
     def _draw_debug(self, img: np.ndarray, real_points: List[Tuple]) -> np.ndarray:

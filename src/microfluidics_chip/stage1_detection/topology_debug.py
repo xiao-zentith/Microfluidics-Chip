@@ -169,6 +169,17 @@ def _render_debug_image(raw_image: np.ndarray, payload: Dict[str, Any]) -> np.nd
             )
 
     fit_info = payload.get("fit", {}) or {}
+    n_det_raw = payload.get("n_det_raw", payload.get("n_det"))
+    n_det_dedup = payload.get("n_det_dedup", payload.get("n_det"))
+    fill_ratio = payload.get("fill_ratio")
+    used_real_points = payload.get("used_real_points")
+    model_chosen = payload.get("model_chosen", fit_info.get("transform_type", "n/a"))
+    reproj_median = payload.get("reproj_median")
+    reproj_mean = payload.get("reproj_mean")
+    slice_mode = payload.get("slice_mode", "canonical")
+    geometry_suspect = payload.get("geometry_suspect", False)
+    pitch_final = payload.get("pitch_final", payload.get("pitch_px", fit_info.get("pitch_px")))
+
     arm_line = "arm_scores=Up:n/a Right:n/a Down:n/a Left:n/a"
     if arm_scores:
         def fmt(name: str) -> str:
@@ -180,9 +191,12 @@ def _render_debug_image(raw_image: np.ndarray, payload: Dict[str, Any]) -> np.nd
         )
     lines = [
         f"attempt={payload.get('attempt_id', 'n/a')} status={payload.get('status', 'unknown')}",
-        f"n_det={payload.get('n_det', 0)} n_inliers={fit_info.get('n_inliers', 0)} rmse={fit_info.get('rmse_px', 'n/a')}",
+        f"n_det_raw={n_det_raw} n_det_dedup={n_det_dedup} n_inliers={fit_info.get('n_inliers', 0)} rmse={fit_info.get('rmse_px', 'n/a')}",
         f"fit={fit_info.get('fit_success', False)} transform={fit_info.get('transform_type', 'n/a')}"
         f" scale={fit_info.get('scale', 'n/a')} rot={fit_info.get('rotation_deg', 'n/a')}",
+        f"pitch_final={pitch_final} fill_ratio={fill_ratio} used_real={used_real_points}",
+        f"model={model_chosen} reproj_median={reproj_median} reproj_mean={reproj_mean}",
+        f"slice_mode={slice_mode} geometry_suspect={int(bool(geometry_suspect))}",
         f"blank_mode={blank_mode} blank_id={blank_id_pred if blank_id_pred is not None else blank_id} old={blank_id_old} color={blank_id_color} chroma={blank_id_chroma}",
         f"blank_status={blank_status_pred} raw={blank_status} color={blank_status_color} chroma={blank_status_chroma} arm_margin={arm_margin} blank_margin={blank_margin}",
         arm_line,
